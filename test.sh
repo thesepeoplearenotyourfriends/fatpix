@@ -1075,6 +1075,28 @@ check_real_projection test/george.zip zip
 check_real_projection test/sample.sqlite sqlite3
 check_real_projection test/sample.wav wav
 
+# SQLite's opaque later pages are justified by an authored KSY extent
+# relationship, not by searching arbitrary parsed integers for a product that
+# happens to equal EOF.
+./clarity.py --analyze --json test/sample.sqlite > "$tmp/sqlite-extent-proof.json"
+python3 - "$tmp/sqlite-extent-proof.json" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+sqlite = [v for v in obj["views"] if v.get("ksy_id") == "sqlite3" and v.get("offset") == 0]
+if len(sqlite) != 1:
+    raise SystemExit(f"FAIL: expected one root SQLite view, got {len(sqlite)}")
+opaque = [a for a in sqlite[0]["annotations"] if a.get("path") == "sqlite3.opaque_allocation_units"]
+if len(opaque) != 1:
+    raise SystemExit(f"FAIL: expected one SQLite opaque-page annotation, got {len(opaque)}")
+proof = opaque[0]
+if proof.get("extent_instance") != "len_database":
+    raise SystemExit(f"FAIL: SQLite extent lacks KSY instance provenance: {proof}")
+if proof.get("size_rule") != "len_page * num_pages":
+    raise SystemExit(f"FAIL: SQLite extent lacks authored size/count relationship: {proof}")
+if proof.get("extent_operands") != ["len_page", "num_pages"]:
+    raise SystemExit(f"FAIL: SQLite extent operands are not explicit: {proof}")
+PY
+
 # The shared RIFF anchor may nominate AVI, but its contradicted form-type
 # literal must not survive beside the strongly corroborated WAV root.
 ./clarity.py --analyze --json test/sample.wav > "$tmp/wav-projection-audit.json"

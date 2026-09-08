@@ -2425,27 +2425,42 @@ def auto_ksy_views(
                         "kind": "container",
                     }] + body
 
-                # Some address-space KSYs decode the first allocation unit and
-                # expose both unit size and unit count as scalar header values,
-                # without spelling out a redundant byte array for the remaining
-                # units. SQLite's real definition is the motivating construct.
-                # When those independently parsed values account exactly for the
-                # supplied root stream, retain the undecoded units explicitly as
-                # opaque structure rather than leaving a false ownership hole.
+                # An address-space KSY may decode its first allocation unit and
+                # explicitly declare the complete extent as ``unit * count`` in
+                # a root value instance, without spelling out a redundant byte
+                # array for the remaining units.  Only that authored expression
+                # proves ownership; coincidentally matching scalar values do not.
                 parsed_extent = int(parsed.get("extent", 0))
-                scalar_ints = {
-                    value for value in parsed.get("values", {}).values()
-                    if isinstance(value, int) and not isinstance(value, bool) and value > 0
-                }
                 stream_extent = len(data) - root_local
-                if (
-                    root_local == 0
-                    and parsed_extent >= 512
-                    and parsed_extent < stream_extent
-                    and parsed_extent in scalar_ints
-                    and stream_extent % parsed_extent == 0
-                    and stream_extent // parsed_extent in scalar_ints
-                ):
+                extent_proof = None
+                root_values = parsed.get("values", {})
+                instance_specs = doc.get("instances", {})
+                if isinstance(instance_specs, dict):
+                    for instance_name, spec in instance_specs.items():
+                        expression = spec.get("value") if isinstance(spec, dict) else None
+                        if not isinstance(expression, str):
+                            continue
+                        match_extent = re.fullmatch(
+                            r"\s*([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*",
+                            expression,
+                        )
+                        if match_extent is None:
+                            continue
+                        left_name, right_name = match_extent.groups()
+                        left = root_values.get(f"{ksy_id}.{left_name}")
+                        right = root_values.get(f"{ksy_id}.{right_name}")
+                        declared = root_values.get(f"{ksy_id}.{instance_name}")
+                        if (
+                            isinstance(left, int) and not isinstance(left, bool)
+                            and isinstance(right, int) and not isinstance(right, bool)
+                            and left > 0 and right > 0
+                            and declared == left * right == stream_extent
+                            and parsed_extent in {left, right}
+                        ):
+                            extent_proof = (str(instance_name), expression, left_name, right_name)
+                            break
+                if root_local == 0 and parsed_extent < stream_extent and extent_proof is not None:
+                    proof_name, proof_expression, unit_name, count_name = extent_proof
                     annotations.append({
                         "start": base_offset + parsed_extent,
                         "end": base_offset + stream_extent,
@@ -2453,7 +2468,9 @@ def auto_ksy_views(
                         "label": "opaque allocation units",
                         "depth": 1,
                         "kind": "payload",
-                        "size_rule": "parsed unit size * parsed unit count",
+                        "size_rule": proof_expression,
+                        "extent_instance": proof_name,
+                        "extent_operands": [unit_name, count_name],
                     })
                 if len(annotations) < 2:
                     continue

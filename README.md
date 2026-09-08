@@ -8,6 +8,8 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Grounded SQLite opaque-page ownership in an explicit KSY page-size/page-count
+  extent relationship instead of inferring geometry from matching scalars.
 - Completed whole-file projection for the real PNG, ZIP, SQLite, and WAV
   specimens and suppressed contradicted same-root views beside strong identity.
 - Separated real-file identity checks from structural-coverage checks, recording
