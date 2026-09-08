@@ -1,0 +1,2734 @@
+#!/usr/bin/env python3
+"""
+fatpix_matrix.py
+A one-file Unicode fat-pixel terminal color wall and tiny LED marquee.
+
+Run:
+  python3 fatpix_matrix.py
+  echo "hello world" | python3 fatpix_matrix.py
+  python3 fatpix_matrix.py --no-marquee
+  python3 fatpix_matrix.py --file firmware.bin
+  cat notes.txt | python3 fatpix_matrix.py --file -
+
+File view:
+  arrows / wasd   move byte cursor
+  PgUp / PgDn     move cursor by half the visible page
+  - / =           zoom out / in (_ / + also work)
+  1-6             analysis lenses
+  i               inspector overlay
+  , / .           inspector previous / next page (HEX wraps to DIFF HEX)
+  mouse click      select one exact fat-pixel byte range
+  mouse drag       extend selection as one contiguous byte range
+  :dump FILE       write the selected bytes to FILE
+  C               ask optional Clarity for a structural overlay
+  ?               help from every interactive state
+
+Paint / board:
+  arrows / hjkl   move paint cursor
+  space / enter   paint selected color
+  1-9             select color
+  x               erase to black
+  c               clear to black
+  f               fill with selected color
+  n               noise burst
+
+Animation modes:
+  w               wave / interference field
+  d               drip / falling smear
+  r               rain / falling trails
+  s               spark / diffuse decay
+  m               marquee / piped or :text message
+  i               idle / manual paint
+
+Animation and display:
+  a               pause / resume
+  [ / ]           slower / faster
+  g               glyph / ANSI skin
+  R               rotate display palette (Unicode skin only)
+  ?               help overlay (pauses animation)
+  :               command line
+  q / Ctrl-C      quit
+
+Commands:
+  clear [color]
+  fill <color>
+  noise [0.0-1.0] [colors...]
+  mode idle|wave|drip|rain|spark|marquee
+  speed <fps>
+  text <message>
+  save <file>
+  load <file>
+
+Colors are 0-8 or names: black white red blue orange yellow green purple brown.
+Saved files are plain Unicode-square boards.
+
+When stdin is piped, fatpix reads the message to EOF and uses /dev/tty for keys.
+Use --no-marquee to ignore piped stdin and launch the normal wall instead.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+import json
+import math
+import os
+import random
+import re
+import select
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+import unicodedata
+import zlib
+from collections import Counter, deque
+from typing import Dict, List, Optional, Tuple
+
+# Unicode large squares. Most terminals render these as two columns wide.
+GLYPHS = ["⬛", "⬜", "🟥", "🟦", "🟧", "🟨", "🟩", "🟪", "🟫"]
+NAMES = ["black", "white", "red", "blue", "orange", "yellow", "green", "purple", "brown"]
+NAME_TO_IDX: Dict[str, int] = {name: i for i, name in enumerate(NAMES)}
+NAME_TO_IDX.update({str(i): i for i in range(len(GLYPHS))})
+GLYPH_TO_IDX: Dict[str, int] = {g: i for i, g in enumerate(GLYPHS)}
+# Same logical colors, but round.  Clarity uses a circle only at a real
+# structural start; the color still carries the structure identity.
+CIRCLE_GLYPHS = ["⚫", "⚪", "🔴", "🔵", "🟠", "🟡", "🟢", "🟣", "🟤"]
+
+# ANSI fallback skin: same logical grid, rendered as colored two-space blocks.
+# Useful if the emoji font gets ugly or mismeasured.
+ANSI_BG = [40, 47, 41, 44, 43, 103, 42, 45, 100]
+
+
+MAX_MARQUEE_CHARS = 4096
+EMPTY_FONT_COLUMN = (0, 0, 0, 0, 0, 0, 0)
+
+# Compact 5x7 font. The numeric key is the ASCII code, which keeps punctuation
+# unambiguous inside this little data table. Lowercase marquee text is uppercased.
+FONT_5X7_DATA = """
+32=00000/00000/00000/00000/00000/00000/00000
+33=00100/00100/00100/00100/00100/00000/00100
+34=01010/01010/01010/00000/00000/00000/00000
+35=01010/11111/01010/01010/11111/01010/00000
+37=11001/11010/00100/01000/10110/00110/00000
+38=01100/10010/10100/01000/10101/10010/01101
+39=00100/00100/01000/00000/00000/00000/00000
+40=00010/00100/01000/01000/01000/00100/00010
+41=01000/00100/00010/00010/00010/00100/01000
+42=00000/10101/01110/11111/01110/10101/00000
+43=00000/00100/00100/11111/00100/00100/00000
+44=00000/00000/00000/00000/00100/00100/01000
+45=00000/00000/00000/11111/00000/00000/00000
+46=00000/00000/00000/00000/00000/00100/00100
+47=00001/00010/00100/01000/10000/00000/00000
+48=01110/10001/10011/10101/11001/10001/01110
+49=00100/01100/00100/00100/00100/00100/01110
+50=01110/10001/00001/00010/00100/01000/11111
+51=11110/00001/00001/01110/00001/00001/11110
+52=00010/00110/01010/10010/11111/00010/00010
+53=11111/10000/10000/11110/00001/00001/11110
+54=01110/10000/10000/11110/10001/10001/01110
+55=11111/00001/00010/00100/01000/01000/01000
+56=01110/10001/10001/01110/10001/10001/01110
+57=01110/10001/10001/01111/00001/00001/01110
+58=00000/00100/00100/00000/00100/00100/00000
+59=00000/00100/00100/00000/00100/00100/01000
+60=00010/00100/01000/10000/01000/00100/00010
+61=00000/00000/11111/00000/11111/00000/00000
+62=01000/00100/00010/00001/00010/00100/01000
+63=01110/10001/00001/00010/00100/00000/00100
+64=01110/10001/10111/10101/10111/10000/01110
+65=01110/10001/10001/11111/10001/10001/10001
+66=11110/10001/10001/11110/10001/10001/11110
+67=01111/10000/10000/10000/10000/10000/01111
+68=11110/10001/10001/10001/10001/10001/11110
+69=11111/10000/10000/11110/10000/10000/11111
+70=11111/10000/10000/11110/10000/10000/10000
+71=01111/10000/10000/10111/10001/10001/01111
+72=10001/10001/10001/11111/10001/10001/10001
+73=11111/00100/00100/00100/00100/00100/11111
+74=00111/00010/00010/00010/00010/10010/01100
+75=10001/10010/10100/11000/10100/10010/10001
+76=10000/10000/10000/10000/10000/10000/11111
+77=10001/11011/10101/10101/10001/10001/10001
+78=10001/11001/10101/10011/10001/10001/10001
+79=01110/10001/10001/10001/10001/10001/01110
+80=11110/10001/10001/11110/10000/10000/10000
+81=01110/10001/10001/10001/10101/10010/01101
+82=11110/10001/10001/11110/10100/10010/10001
+83=01111/10000/10000/01110/00001/00001/11110
+84=11111/00100/00100/00100/00100/00100/00100
+85=10001/10001/10001/10001/10001/10001/01110
+86=10001/10001/10001/10001/10001/01010/00100
+87=10001/10001/10001/10101/10101/10101/01010
+88=10001/10001/01010/00100/01010/10001/10001
+89=10001/10001/01010/00100/00100/00100/00100
+90=11111/00001/00010/00100/01000/10000/11111
+91=01110/01000/01000/01000/01000/01000/01110
+92=10000/01000/00100/00010/00001/00000/00000
+93=01110/00010/00010/00010/00010/00010/01110
+95=00000/00000/00000/00000/00000/00000/11111
+124=00100/00100/00100/00100/00100/00100/00100
+"""
+
+
+FILE_LENSES = {
+    1: "literal",
+    2: "xor-prev",
+    3: "delta-prev",
+    4: "compress",
+    5: "neighbor-diff",
+    6: "cursor-sim",
+}
+
+# Browsing scales are deliberately denser than the old powers-of-four jumps.
+# Small byte/field sizes get the most choices; larger scales keep a simple
+# power-of-two / one-and-a-half-power rhythm.  :scale N remains unrestricted.
+_FILE_SCALE_SMALL = (
+    1, 2, 3, 4, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96,
+    128, 192, 256, 384, 512, 768,
+)
+_FILE_SCALE_MAX = 1 << 50
+CLARITY_MAX_VISIBLE_BYTES = 16 * 1024 * 1024
+CLARITY_MAX_HALO_BYTES = 1024 * 1024
+CLARITY_TIMEOUT_SECONDS = 15
+
+# Structural colors are a FatPix lens, not an overlay.  Repeated field types get
+# the vivid six first (the natural red→orange→yellow→green→blue→purple legend);
+# singleton fields then get brown/white.  Black remains available to the normal
+# byte lens around recognized structure.
+CLARITY_SEMANTIC_PALETTE = (2, 4, 5, 6, 3, 7, 8, 1)
+
+
+def _build_file_scale_ladder() -> Tuple[int, ...]:
+    steps = list(_FILE_SCALE_SMALL)
+    power = 1024
+    while power <= _FILE_SCALE_MAX:
+        steps.append(power)
+        one_and_half = power + power // 2
+        if one_and_half <= _FILE_SCALE_MAX:
+            steps.append(one_and_half)
+        power <<= 1
+    return tuple(sorted(set(steps)))
+
+
+FILE_SCALE_LADDER = _build_file_scale_ladder()
+
+FILE_HELP_TEXT = [
+    "fatpix file view — bytes as fat pixels",
+    "nav: arrows/wasd move | PgUp/PgDn half-page | -/= zoom | g goto | i inspect",
+    "     C Clarity semantic view | c Clarity legend | : command | ? help",
+    "",
+    "LENSES / COLOR KEY",
+    "1 literal 1B: 00 black | ff white | printable 20-7e green",
+    "  01-1f blue | 7f yellow | 80-aa red | ab-d5 purple | d6-fe brown",
+    "  coarse: black all00 | white allff | green >=85% text | brown >=75% zero",
+    "  blue repeat/H<2 | orange H<4 | yellow H<5.5 | purple H<7 | red H>=7",
+    "2 xor: apply view-1 colors after each byte XOR previous byte",
+    "3 delta: mean |byte-prev|; black low -> blue/green/yellow/orange/purple -> red",
+    "4 compress: zlib/raw; low=compresses well -> scalar ramp -> high=incompressible",
+    "5 diff: JSD vs previous cell; low=same -> scalar ramp -> high=different",
+    "6 similar: direct byte-position match to cursor; low=black -> high=white",
+    "",
+    "SCALAR (3/4/5): black <=.5% | blue <5 | green <15 | yellow <30",
+    "  orange <50 | purple <70 | red >=70",
+    "SIMILAR (6): black <2 | blue <10 | green <25 | yellow <45",
+    "  orange <65 | red <85 | purple <99.9 | white >=99.9",
+    "",
+    "INSPECT: i open/close | ,/. prev/next page (</> also work) | Esc close",
+    "  pages: HEX TEXT NUM MAGIC STATS RANGE DIFF-HEX | ? always opens contextual help",
+    "MOUSE: click selects one fat pixel | drag selects one contiguous byte range",
+    "  selection keeps exact byte endpoints across zoom/resize; Esc clears when inspect is closed",
+    "  Shift-drag is normally the terminal's own text selection while mouse mode is active",
+    "H=Shannon entropy (bits/byte). JSD uses 16 byte-value bins.",
+    "commands: goto <offset> | scale <bytes> | view <1-6|name> | dump <file> | clarity",
+    "Clarity: known fields replace byte/lens colors; matching circles mark real field starts.",
+    "cursor is an exact byte address; zoom changes bytes summarized per cell.",
+]
+
+INSPECT_HELP_TEXT = [
+    "fatpix inspector — interrogate the cell without moving the map",
+    "",
+    "i / Esc       close inspector",
+    ", / .         previous / next inspector page",
+    "< / >         shifted aliases for , / .",
+    "arrows / wasd move the underlying byte cursor",
+    "PgUp / PgDn  move cursor by half the visible byte span",
+    "- / =         zoom out / in (_ / + are aliases)",
+    "1-6           change FatPix lens while inspector stays open",
+    "g             goto offset     : command line     q quit",
+    "mouse         click/drag selects contiguous bytes; :dump FILE writes them",
+    "C             toggle optional Clarity semantic view",
+    "c             toggle contextual Clarity legend",
+    "?             this help; works from inspector and command line too",
+    "",
+    "PAGES",
+    "HEX    raw bytes from the exact data sample used by the selected cell",
+    "TEXT   printable ASCII runs in that sample",
+    "NUM    common integer/float interpretations at the inspection anchor",
+    "MAGIC  cheap known signatures found in the sample (not a full parser)",
+    "STATS  entropy, byte counts, zlib ratio, dominant byte values",
+    "RANGE  exact cell/sample offsets, row stride, head/tail bytes",
+    "DIFF HEX  same layout as HEX; gray=unchanged, bright=changed vs prior cursor",
+    "",
+    "Zoom keeps the exact inspector byte locus in view while changing scale.",
+    "At coarse zoom the cell may represent far more data than was sampled.",
+    "The inspector says which sample range it is showing; it does not pretend",
+    "that a 1 KiB sample describes every byte of a 256 MiB cell.",
+]
+
+
+
+class ByteSource:
+    """Seekable byte source for regular files/block devices, or buffered stdin."""
+
+    BLKGETSIZE64 = 0x80081272
+
+    def __init__(self, path: Optional[str] = None, data: Optional[bytes] = None) -> None:
+        if (path is None) == (data is None):
+            raise ValueError("ByteSource needs exactly one of path or data")
+        self.path = path
+        self._data = data
+        self.fd: Optional[int] = None
+        if data is not None:
+            self.size = len(data)
+            return
+
+        assert path is not None
+        self.fd = os.open(path, os.O_RDONLY)
+        st = os.fstat(self.fd)
+        self.size = st.st_size
+        if self.size <= 0:
+            try:
+                self.size = os.lseek(self.fd, 0, os.SEEK_END)
+                os.lseek(self.fd, 0, os.SEEK_SET)
+            except OSError:
+                self.size = 0
+        if self.size <= 0 and stat.S_ISBLK(st.st_mode):
+            try:
+                import fcntl
+                buf = bytearray(8)
+                fcntl.ioctl(self.fd, self.BLKGETSIZE64, buf, True)
+                self.size = struct.unpack("=Q", buf)[0]
+            except (ImportError, OSError, struct.error):
+                self.size = 0
+        if self.size <= 0 and not stat.S_ISREG(st.st_mode):
+            self.close()
+            raise OSError(f"could not determine size of {path!r}")
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def read(self, offset: int, length: int) -> bytes:
+        if length <= 0 or offset < 0 or offset >= self.size:
+            return b""
+        length = min(length, self.size - offset)
+        if self._data is not None:
+            return self._data[offset: offset + length]
+        assert self.fd is not None
+        if hasattr(os, "pread"):
+            return os.pread(self.fd, length, offset)
+        os.lseek(self.fd, offset, os.SEEK_SET)
+        return os.read(self.fd, length)
+
+    def sample(self, offset: int, length: int, budget: int = 1024) -> bytes:
+        """Read one bounded representative window from a range.
+
+        One contiguous read is intentionally preferred over many tiny random reads:
+        coarse whole-device views care more about responsiveness than pretending a
+        1 KiB sample is an exhaustive description of a 256 MiB cell.
+        """
+        if length <= budget:
+            return self.read(offset, length)
+        rel = (length - budget) // 2
+        return self.read(offset + rel, budget)
+
+
+def parse_offset(text: str) -> int:
+    text = text.strip().lower()
+    multipliers = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+    if text and text[-1] in multipliers:
+        return int(text[:-1], 0) * multipliers[text[-1]]
+    return int(text, 0)
+
+
+def human_size(value: int) -> str:
+    n = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024.0 or unit == "TiB":
+            return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{value} B"
+
+
+def shannon_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    counts = Counter(data)
+    total = len(data)
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
+
+
+def build_font() -> Dict[str, Tuple[str, ...]]:
+    font: Dict[str, Tuple[str, ...]] = {}
+    for line in FONT_5X7_DATA.strip().splitlines():
+        code, rows = line.split("=", 1)
+        font[chr(int(code))] = tuple(rows.split("/"))
+    return font
+
+
+FONT_5X7 = build_font()
+
+
+ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def visible_width(text: str) -> int:
+    plain = ANSI_SGR_RE.sub("", text)
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in plain)
+
+def fit_line(text: str, width: int) -> str:
+    out: List[str] = []
+    used = 0
+    i = 0
+    while i < len(text):
+        if text[i] == "\x1b":
+            match = ANSI_SGR_RE.match(text, i)
+            if match:
+                out.append(match.group(0))
+                i = match.end()
+                continue
+        ch = text[i]
+        cell_width = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + cell_width > width:
+            break
+        out.append(ch)
+        used += cell_width
+        i += 1
+    return "".join(out)
+
+def pad_line(text: str, width: int) -> str:
+    clipped = fit_line(text, width)
+    if "\x1b[" in clipped:
+        clipped += "\x1b[0;97;40m"
+    return clipped + " " * max(0, width - visible_width(clipped))
+
+HELP_TEXT = [
+    "fatpix matrix — terminal takeover color wall",
+    "",
+    "PAINT / BOARD",
+    "  arrows/hjkl move     space/enter paint     1-9 select color     x erase",
+    "  c clear              f fill selected       n noise burst",
+    "",
+    "ANIMATION MODES",
+    "  w wave/interference  d drip/falling smear",
+    "  r rain/trails        s spark/diffuse decay",
+    "  m marquee/text       i idle/manual paint",
+    "",
+    "ANIMATION",
+    "  a pause/resume       [ / ] slower/faster",
+    "DISPLAY",
+    "  g glyph/ANSI skin    R rotate palette (Unicode skin only)",
+    "OTHER",
+    "  : command line       ? or Esc close help    q quit",
+    "",
+    "COMMANDS",
+    "  clear [color] | fill <color> | noise [0.0-1.0] [colors...]",
+    "  mode idle|wave|drip|rain|spark|marquee | speed <fps>",
+    "  text <message> | save <file> | load <file>",
+    "command colors: 0-8 or black white red blue orange yellow green purple brown",
+]
+
+
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+def parse_color(token: str, default: Optional[int] = None) -> Optional[int]:
+    v = NAME_TO_IDX.get(token.strip().lower())
+    return default if v is None else v
+
+
+class RawTerminal:
+    """Tiny stdlib terminal wrapper: alternate screen, raw input, ANSI output."""
+
+    _MOUSE_RE = re.compile(br"^\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+    _KEY_SEQS = (
+        (b"\x1b[A", "UP"),
+        (b"\x1b[B", "DOWN"),
+        (b"\x1b[C", "RIGHT"),
+        (b"\x1b[D", "LEFT"),
+        (b"\x1b[5~", "PGUP"),
+        (b"\x1b[6~", "PGDN"),
+    )
+
+    def __init__(self, input_fd: int, mouse: bool = False) -> None:
+        self.stdin_fd = input_fd
+        self.mouse = mouse
+        self.old_termios: Optional[List] = None
+        self.force_resize = True
+        self._input = bytearray()
+        self._events = deque()
+
+    def __enter__(self) -> "RawTerminal":
+        if not os.isatty(self.stdin_fd) or not sys.stdout.isatty():
+            raise RuntimeError("fatpix needs a real interactive terminal for keys and display.")
+        self.old_termios = termios.tcgetattr(self.stdin_fd)
+        tty.setcbreak(self.stdin_fd)
+        # Alternate screen, clear, hide cursor. In file mode ask the terminal to
+        # report button presses and button-held motion using modern SGR coordinates.
+        # The terminal remains the mouse driver; FatPix never opens /dev/input.
+        sys.stdout.write("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l")
+        if self.mouse:
+            sys.stdout.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
+        sys.stdout.flush()
+        signal.signal(signal.SIGWINCH, self._on_resize)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.old_termios is not None:
+            termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, self.old_termios)
+        # Disable mouse reporting before returning the terminal to its owner.
+        if self.mouse:
+            sys.stdout.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l")
+        # Reset colors, show cursor, leave alternate screen.
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+
+    def _on_resize(self, signum, frame) -> None:  # noqa: ANN001
+        self.force_resize = True
+
+    def size(self) -> Tuple[int, int]:
+        s = shutil.get_terminal_size(fallback=(80, 24))
+        return s.columns, s.lines
+
+    def _parse_input(self) -> None:
+        while self._input:
+            if self._input[0] in (3, 4):
+                del self._input[:1]
+                self._events.append("QUIT")
+                continue
+
+            if self._input[0] == 0x1B:
+                mouse = self._MOUSE_RE.match(self._input)
+                if mouse:
+                    code, x, y, final = mouse.groups()
+                    consumed = mouse.end()
+                    del self._input[:consumed]
+                    self._events.append((
+                        "MOUSE",
+                        int(code),
+                        int(x),
+                        int(y),
+                        final.decode("ascii"),
+                    ))
+                    continue
+
+                matched = False
+                for seq, name in self._KEY_SEQS:
+                    if self._input.startswith(seq):
+                        del self._input[:len(seq)]
+                        self._events.append(name)
+                        matched = True
+                        break
+                if matched:
+                    continue
+
+                # A lone ESC is an ordinary key. Hold only obviously partial CSI
+                # sequences so a split mouse/arrow read is not mistaken for Escape.
+                raw = bytes(self._input)
+                partial_mouse = (
+                    raw.startswith(b"\x1b[<")
+                    and len(raw) < 64
+                    and not raw.endswith((b"M", b"m"))
+                )
+                if len(raw) > 1 and (
+                    partial_mouse
+                    or b"\x1b[<".startswith(raw)
+                    or any(seq.startswith(raw) for seq, _ in self._KEY_SEQS)
+                ):
+                    return
+                del self._input[:1]
+                self._events.append("ESC")
+                continue
+
+            first = self._input[0]
+            if first < 0x80:
+                del self._input[:1]
+                self._events.append(chr(first))
+                continue
+
+            # FatPix commands are ASCII, but don't corrupt a pasted UTF-8 char.
+            for length in (2, 3, 4):
+                if len(self._input) < length:
+                    return
+                try:
+                    ch = bytes(self._input[:length]).decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                del self._input[:length]
+                self._events.append(ch)
+                break
+            else:
+                del self._input[:1]
+
+    def read_key(self):
+        if self._events:
+            return self._events.popleft()
+        ready, _, _ = select.select([self.stdin_fd], [], [], 0)
+        if ready:
+            try:
+                data = os.read(self.stdin_fd, 4096)
+            except BlockingIOError:
+                data = b""
+            if data:
+                self._input.extend(data)
+                self._parse_input()
+        return self._events.popleft() if self._events else None
+
+
+class FatPix:
+    def __init__(
+        self,
+        marquee_text: Optional[str] = None,
+        file_source: Optional[ByteSource] = None,
+        file_label: str = "",
+        private: bool = False,
+        clarity_path: Optional[str] = None,
+    ) -> None:
+        cols, rows = shutil.get_terminal_size(fallback=(100, 30))
+        self.status_lines = 2
+        self.cell_w = 2
+        self.term_cols = cols
+        self.term_rows = rows
+        self.w = max(8, cols // self.cell_w)
+        self.h = max(4, rows - self.status_lines)
+        self.grid: List[List[int]] = [[0 for _ in range(self.w)] for _ in range(self.h)]
+        self.cursor_x = self.w // 2
+        self.cursor_y = self.h // 2
+        self.selected = 6
+        self.file_source = file_source
+        self.private = private
+        self.file_label = "PR:[redacted]" if private and file_label else (f"PR:[{file_label}]" if file_label else "stdin")
+        self.clarity_path = clarity_path
+        # enabled = user has the semantic lens switched on; active = this
+        # viewport currently contains at least one recognized structural view.
+        # Keeping these separate makes "C" a real toggle even while Clarity
+        # correctly abstains on an unrecognized region.
+        self.clarity_enabled = False
+        self.clarity_active = False
+        self.clarity_annotations: List[dict] = []
+        self.clarity_views: List[dict] = []
+        self.clarity_analysis_range: Optional[Tuple[int, int]] = None
+        self.clarity_cell_states: List[List[Tuple[Optional[int], bool]]] = []
+        self.clarity_palette: Dict[str, int] = {}
+        self.clarity_legend_entries: List[Tuple[str, int, int]] = []
+        self.clarity_legend_open = False
+        self.file_bytes_per_cell = 1
+        self.file_lens = 1
+        self.file_cursor_addr = 0
+        self.file_view_start = 0
+        self.file_cell_info: List[List[Optional[dict]]] = []
+        self.file_dirty = file_source is not None
+        self.mode = "file" if file_source is not None else "wave"
+        self.animate = False if file_source is not None else True
+        self.fps = 16.0
+        self.tick = 0
+        self.message = "" if file_source is not None else "1-9 colors, arrows move, space paint, : commands, ? help, q quit"
+        self.command_open = False
+        self.command = ""
+        self.show_help = False
+        self.help_restore_animate: Optional[bool] = None
+        self.inspect_open = False
+        self.inspect_pages = ("HEX", "TEXT", "NUM", "MAGIC", "STATS", "RANGE", "DIFF HEX")
+        self.inspect_page = 0
+        self.inspect_prev_data: Optional[bytes] = None
+        self.inspect_prev_data_start: Optional[int] = None
+        self.inspect_prev_scale: Optional[int] = None
+        # Exact byte locus shown by the inspector.  At coarse scales the map
+        # summarizes a centered sample inside each fat pixel; keeping that
+        # locus separate from the cell's start lets zoom move toward what the
+        # inspector is actually showing instead of jumping back to cell start.
+        self.inspect_focus_addr: Optional[int] = None
+        self.inspect_data_cache_key: Optional[Tuple[int, int]] = None
+        self.inspect_data_cache: bytes = b""
+        self.file_selection_anchor: Optional[Tuple[int, int]] = None
+        self.file_selection_start: Optional[int] = None
+        self.file_selection_end: Optional[int] = None
+        self.file_mouse_dragging = False
+        self.use_ansi_skin = False
+        self.palette_offset = 0
+        self.marquee_text = ""
+        self.marquee_columns: List[Tuple[int, ...]] = []
+        self.marquee_x = self.w
+        if marquee_text:
+            self.set_marquee_text(marquee_text)
+        if self.file_source is not None:
+            self.refresh_file_grid()
+
+    @property
+    def file_mode(self) -> bool:
+        return self.file_source is not None
+
+    def displayed_color(self, color: int) -> int:
+        if self.use_ansi_skin or not self.palette_offset or color < 2:
+            return color
+        # Rotate the lively six-color ring; black, white, and brown stay anchored.
+        ring = [2, 4, 5, 6, 3, 7]
+        if color not in ring:
+            return color
+        return ring[(ring.index(color) + self.palette_offset) % len(ring)]
+
+    def color_label(self, color: int) -> str:
+        shown = self.displayed_color(color)
+        if shown == color:
+            return f"{color}:{NAMES[color]}"
+        return f"{color}:{NAMES[color]}→{NAMES[shown]}"
+
+    @staticmethod
+    def _byte_color(value: int) -> Tuple[int, str]:
+        if value == 0:
+            return 0, "00"
+        if value == 255:
+            return 1, "ff"
+        if 32 <= value <= 126:
+            return 6, "text"
+        ring = (3, 4, 5, 2, 7, 8)
+        return ring[min(len(ring) - 1, (value * len(ring)) // 256)], "byte"
+
+    @staticmethod
+    def _metrics(data: bytes) -> dict:
+        if not data:
+            return {
+                "entropy": 0.0, "zero": 0.0, "ff": 0.0, "printable": 0.0,
+                "unique": 0, "hist16": (0,) * 16,
+            }
+        n = len(data)
+        hist16 = [0] * 16
+        printable_count = 0
+        for b in data:
+            hist16[b >> 4] += 1
+            if b in (9, 10, 13) or 32 <= b <= 126:
+                printable_count += 1
+        return {
+            "entropy": shannon_entropy(data),
+            "zero": data.count(0) / n,
+            "ff": data.count(255) / n,
+            "printable": printable_count / n,
+            "unique": len(set(data)),
+            "hist16": tuple(hist16),
+        }
+
+    @staticmethod
+    def _summary_color(metrics: dict) -> Tuple[int, str]:
+        zero = metrics["zero"]
+        ff = metrics["ff"]
+        printable = metrics["printable"]
+        unique = metrics["unique"]
+        entropy = metrics["entropy"]
+        if zero == 1.0:
+            return 0, "zero"
+        if ff == 1.0:
+            return 1, "ff"
+        if printable >= 0.85:
+            return 6, "text"
+        if zero >= 0.75:
+            return 8, "sparse"
+        if unique <= 4 or entropy < 2.0:
+            return 3, "repeat"
+        if entropy < 4.0:
+            return 4, "low-H"
+        if entropy < 5.5:
+            return 5, "mid-H"
+        if entropy < 7.0:
+            return 7, "dense"
+        return 2, "high-H"
+
+    @staticmethod
+    def _scalar_color(value: float) -> int:
+        """Map 0..1 from quiet/dark to loud/hot."""
+        value = max(0.0, min(1.0, value))
+        if value <= 0.005:
+            return 0
+        if value < 0.05:
+            return 3
+        if value < 0.15:
+            return 6
+        if value < 0.30:
+            return 5
+        if value < 0.50:
+            return 4
+        if value < 0.70:
+            return 7
+        return 2
+
+    @staticmethod
+    def _similarity_color(value: float) -> int:
+        value = max(0.0, min(1.0, value))
+        if value < 0.02:
+            return 0
+        if value < 0.10:
+            return 3
+        if value < 0.25:
+            return 6
+        if value < 0.45:
+            return 5
+        if value < 0.65:
+            return 4
+        if value < 0.85:
+            return 2
+        if value < 0.999:
+            return 7
+        return 1
+
+    @staticmethod
+    def _js_divergence(a: Tuple[int, ...], b: Tuple[int, ...]) -> float:
+        sa = sum(a)
+        sb = sum(b)
+        if not sa or not sb:
+            return 0.0
+        pa = [x / sa for x in a]
+        pb = [x / sb for x in b]
+        total = 0.0
+        for x, y in zip(pa, pb):
+            m = (x + y) * 0.5
+            if x:
+                total += 0.5 * x * math.log2(x / m)
+            if y:
+                total += 0.5 * y * math.log2(y / m)
+        return max(0.0, min(1.0, total))
+
+    @staticmethod
+    def _direct_similarity(a: bytes, b: bytes) -> float:
+        n = min(len(a), len(b))
+        if n <= 0:
+            return 0.0
+        return sum(1 for i in range(n) if a[i] == b[i]) / n
+
+    @staticmethod
+    def _xor_bytes(data: bytes, previous: int) -> bytes:
+        out = bytearray(len(data))
+        p = previous
+        for i, b in enumerate(data):
+            out[i] = b ^ p
+            p = b
+        return bytes(out)
+
+    @staticmethod
+    def _delta_values(data: bytes, previous: int) -> List[int]:
+        out: List[int] = []
+        p = previous
+        for b in data:
+            out.append(abs(b - p))
+            p = b
+        return out
+
+    def _make_file_info(
+        self, start: int, span: int, sample: bytes, context: bytes, previous: int
+    ) -> dict:
+        metrics = self._metrics(sample)
+        if span <= 0:
+            base_color, base_kind = 8, "eof"
+        elif not sample:
+            base_color, base_kind = 8, "unreadable"
+        elif span == 1:
+            base_color, base_kind = self._byte_color(sample[0])
+        else:
+            base_color, base_kind = self._summary_color(metrics)
+        return {
+            "start": start, "span": span, "sample": sample, "context": context,
+            "prev_byte": previous, "base_color": base_color, "kind": base_kind,
+            **metrics,
+        }
+
+    def _file_cell_sample_from_batch(
+        self, batch: bytes, batch_start: int, start: int, span: int
+    ) -> Tuple[bytes, bytes, int]:
+        if span <= 0:
+            return b"", b"", 0
+        rel = start - batch_start
+        if span <= 1024:
+            sample_start = start
+            sample = batch[rel: rel + span]
+        else:
+            sample_start = start + (span - 1024) // 2
+            sample_rel = sample_start - batch_start
+            sample = batch[sample_rel: sample_rel + 1024]
+        prev_rel = sample_start - batch_start - 1
+        previous = batch[prev_rel] if 0 <= prev_rel < len(batch) else 0
+        if span < 256:
+            context = batch[rel: rel + 256]
+        else:
+            context = sample
+        return sample, context, previous
+
+    def _file_cell_sample_direct(self, start: int, span: int) -> Tuple[bytes, bytes, int]:
+        assert self.file_source is not None
+        if span <= 0:
+            return b"", b"", 0
+        budget = min(1024, span)
+        sample_start = start if span <= 1024 else start + (span - budget) // 2
+        read_start = sample_start - 1 if sample_start > 0 else sample_start
+        want = budget + (1 if sample_start > 0 else 0)
+        block = self.file_source.read(read_start, want)
+        if sample_start > 0:
+            previous = block[0] if block else 0
+            sample = block[1:]
+        else:
+            previous = 0
+            sample = block
+        return sample, sample, previous
+
+    def refresh_file_grid(self) -> None:
+        if not self.file_mode:
+            return
+        assert self.file_source is not None
+        self.file_cell_info = [[None for _ in range(self.w)] for _ in range(self.h)]
+        cells = self.w * self.h
+        total_span = cells * self.file_bytes_per_cell
+
+        # Fine/medium views are cheaper and more faithful as one sequential read.
+        # Huge views avoid enormous reads and take one representative read per cell.
+        batch = None
+        batch_start = 0
+        if total_span <= 8 * 1024 * 1024 and self.file_view_start < self.file_source.size:
+            batch_start = max(0, self.file_view_start - 1)
+            extra = (self.file_view_start - batch_start) + 256
+            want = min(self.file_source.size - batch_start, total_span + extra)
+            batch = self.file_source.read(batch_start, want)
+
+        for y in range(self.h):
+            for x in range(self.w):
+                start = self.file_view_start + (y * self.w + x) * self.file_bytes_per_cell
+                span = min(self.file_bytes_per_cell, max(0, self.file_source.size - start))
+                if batch is not None:
+                    sample, context, previous = self._file_cell_sample_from_batch(
+                        batch, batch_start, start, span
+                    )
+                else:
+                    sample, context, previous = self._file_cell_sample_direct(start, span)
+                self.file_cell_info[y][x] = self._make_file_info(
+                    start, span, sample, context, previous
+                )
+
+        self.file_dirty = False
+        self.sync_file_cursor_to_screen()
+        self.recolor_file_grid()
+        # A semantic lens follows the viewport.  Refreshes happen only when the
+        # file grid itself is refreshed (pan/goto/zoom/resize), not for every
+        # cursor step inside a stable viewport.
+        if self.clarity_enabled:
+            self.run_clarity_overlay()
+        elif self.clarity_active:
+            self.rebuild_clarity_cell_states()
+
+    def current_file_info(self) -> Optional[dict]:
+        if not self.file_cell_info or not (0 <= self.cursor_y < len(self.file_cell_info)):
+            return None
+        row = self.file_cell_info[self.cursor_y]
+        if not (0 <= self.cursor_x < len(row)):
+            return None
+        return row[self.cursor_x]
+
+    @staticmethod
+    def _cell_inspection_start(info: dict) -> int:
+        """Exact source offset of the representative bytes shown for a cell."""
+        span = info.get("span", 0)
+        start = info.get("start", 0)
+        if span <= 1024:
+            return start
+        return start + (span - min(1024, span)) // 2
+
+    def _set_inspect_focus(self, addr: Optional[int]) -> None:
+        if addr is not None and self.file_source is not None:
+            addr = clamp(addr, 0, max(0, self.file_source.size - 1))
+        if addr != self.inspect_focus_addr:
+            self.inspect_focus_addr = addr
+            self.inspect_data_cache_key = None
+            self.inspect_data_cache = b""
+
+    def recolor_file_grid(self) -> None:
+        if not self.file_mode:
+            return
+        self.grid = [[0 for _ in range(self.w)] for _ in range(self.h)]
+        cursor_info = self.current_file_info()
+        previous_info: Optional[dict] = None
+
+        for y in range(self.h):
+            for x in range(self.w):
+                info = self.file_cell_info[y][x]
+                if info is None:
+                    continue
+                sample = info["sample"]
+                lens = self.file_lens
+                detail = ""
+
+                if lens == 1:
+                    color = info["base_color"]
+                    if info["span"] == 1 and sample:
+                        b = sample[0]
+                        asc = chr(b) if 32 <= b <= 126 else "."
+                        detail = f"byte=0x{b:02x} ascii={asc!r} kind={info['kind']}"
+                    else:
+                        detail = (
+                            f"kind={info['kind']} H={info['entropy']:.2f} "
+                            f"zero={info['zero']:.0%} text={info['printable']:.0%}"
+                        )
+
+                elif lens == 2:
+                    transformed = self._xor_bytes(sample, info["prev_byte"])
+                    tm = self._metrics(transformed)
+                    if info["span"] == 1 and transformed:
+                        color, kind = self._byte_color(transformed[0])
+                        detail = f"raw=0x{sample[0]:02x} xor-prev=0x{transformed[0]:02x} {kind}"
+                    else:
+                        color, kind = self._summary_color(tm) if transformed else (8, "eof")
+                        detail = f"xor kind={kind} H={tm['entropy']:.2f} zero={tm['zero']:.0%}"
+
+                elif lens == 3:
+                    deltas = self._delta_values(sample, info["prev_byte"])
+                    mean = (sum(deltas) / len(deltas) / 255.0) if deltas else 0.0
+                    color = self._scalar_color(mean)
+                    if info["span"] == 1 and deltas:
+                        detail = f"raw=0x{sample[0]:02x} |delta|={deltas[0]}"
+                    else:
+                        detail = f"mean |delta|={mean * 255.0:.1f}/255"
+
+                elif lens == 4:
+                    data = info["context"] or sample
+                    if data:
+                        packed = zlib.compress(data, 1)
+                        ratio = min(1.0, len(packed) / len(data))
+                    else:
+                        ratio = 0.0
+                    color = self._scalar_color(ratio)
+                    detail = f"zlib/raw={ratio:.0%} context={len(data)}B"
+
+                elif lens == 5:
+                    score = (
+                        self._js_divergence(info["hist16"], previous_info["hist16"])
+                        if previous_info is not None else 0.0
+                    )
+                    color = self._scalar_color(score)
+                    detail = f"neighbor JSD={score:.3f}"
+
+                elif lens == 6:
+                    score = (
+                        self._direct_similarity(sample, cursor_info["sample"])
+                        if cursor_info is not None else 0.0
+                    )
+                    color = self._similarity_color(score)
+                    detail = f"cursor similarity={score:.0%}"
+
+                else:
+                    color = info["base_color"]
+                    detail = "unknown lens"
+
+                info["lens_detail"] = detail
+                self.grid[y][x] = color
+                previous_info = info
+
+    def sync_file_cursor_to_screen(self) -> None:
+        if not self.file_mode:
+            return
+        rel = max(0, self.file_cursor_addr - self.file_view_start) // self.file_bytes_per_cell
+        cells = self.w * self.h
+        rel = clamp(rel, 0, max(0, cells - 1))
+        self.cursor_x = rel % self.w
+        self.cursor_y = rel // self.w
+
+    def center_file_on_cursor(self) -> None:
+        if not self.file_mode:
+            return
+        assert self.file_source is not None
+        cells = self.w * self.h
+        half = (cells // 2) * self.file_bytes_per_cell
+        start = max(0, self.file_cursor_addr - half)
+        start = (start // self.file_bytes_per_cell) * self.file_bytes_per_cell
+        max_start = max(0, self.file_source.size - cells * self.file_bytes_per_cell)
+        if start > max_start:
+            start = (max_start // self.file_bytes_per_cell) * self.file_bytes_per_cell
+        self.file_view_start = max(0, start)
+        self.file_dirty = True
+
+    def move_file_cursor_bytes(self, delta: int) -> None:
+        assert self.file_source is not None
+        old_addr = self.file_cursor_addr
+        new_addr = clamp(old_addr + delta, 0, max(0, self.file_source.size - 1))
+        if new_addr != old_addr:
+            self.capture_inspector_baseline()
+            if self.inspect_open and self.inspect_focus_addr is not None:
+                # Move the exact inspected locus by the same byte distance as
+                # the map cursor, preserving its position inside coarse cells.
+                self._set_inspect_focus(self.inspect_focus_addr + (new_addr - old_addr))
+        self.file_cursor_addr = new_addr
+        viewport_end = self.file_view_start + self.w * self.h * self.file_bytes_per_cell
+        if self.file_cursor_addr < self.file_view_start or self.file_cursor_addr >= viewport_end:
+            self.center_file_on_cursor()
+            self.refresh_file_grid()
+        else:
+            self.sync_file_cursor_to_screen()
+            if self.file_lens == 6:
+                self.recolor_file_grid()
+
+    def move_file_cursor(self, dx: int, dy: int) -> None:
+        delta = (dx + dy * self.w) * self.file_bytes_per_cell
+        self.move_file_cursor_bytes(delta)
+
+    def _inspector_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        if not (self.file_mode and self.inspect_open):
+            return None
+        width = min(64, max(8, self.term_cols - 2))
+        height = min(16, max(4, self.h))
+        cursor_col = self.cursor_x * self.cell_w + 1
+        cursor_row = self.cursor_y + 1
+        left = 2 if cursor_col > self.term_cols // 2 else max(1, self.term_cols - width)
+        top = 1 if cursor_row > self.h // 2 else max(1, self.h - height + 1)
+        return left, top, width, height
+
+    def clear_clarity_overlay(self) -> None:
+        self.clarity_enabled = False
+        self.clarity_active = False
+        self.clarity_annotations = []
+        self.clarity_views = []
+        self.clarity_analysis_range = None
+        self.clarity_cell_states = []
+        self.clarity_palette = {}
+        self.clarity_legend_entries = []
+        self.clarity_legend_open = False
+        self.message = "Clarity semantic view off"
+
+    def run_clarity_overlay(self) -> None:
+        if not self.file_mode or self.file_source is None:
+            return
+        if not self.clarity_path:
+            self.clarity_enabled = False
+            self.message = "Clarity unavailable; use --clarity PATH or place clarity.py beside FatPix"
+            return
+
+        self.clarity_enabled = True
+        # Never leave a previous viewport's semantics painted while a new
+        # analysis attempt fails, abstains, or is too coarse to run.
+        self.clarity_active = False
+        self.clarity_annotations = []
+        self.clarity_views = []
+        self.clarity_cell_states = []
+        self.clarity_palette = {}
+        self.clarity_legend_entries = []
+
+        visible_start = self.file_view_start
+        visible_span = min(
+            self.file_source.size - visible_start,
+            self.w * self.h * self.file_bytes_per_cell,
+        )
+        if visible_span <= 0:
+            self.message = "Clarity: no visible bytes"
+            return
+        if visible_span > CLARITY_MAX_VISIBLE_BYTES:
+            self.message = (
+                "Clarity: zoom in; visible span is "
+                f"{human_size(visible_span)} (limit {human_size(CLARITY_MAX_VISIBLE_BYTES)})"
+            )
+            return
+
+        # Give structure detectors enough context not to mistake the viewport edge
+        # for a real boundary, without turning a small interactive query into a
+        # whole-device scan.
+        halo = min(CLARITY_MAX_HALO_BYTES, max(512, visible_span // 2))
+        analysis_start = max(0, visible_start - halo)
+        analysis_end = min(self.file_source.size, visible_start + visible_span + halo)
+        payload = self.file_source.read(analysis_start, analysis_end - analysis_start)
+        if not payload:
+            self.message = "Clarity: analysis read returned no bytes"
+            return
+
+        command = [
+            sys.executable,
+            self.clarity_path,
+            "--json",
+            "--max-lag", "16",
+            "--windowed",
+            "--base-offset", hex(analysis_start),
+            "-",
+        ]
+        if self.private:
+            command.insert(2, "--private")
+        try:
+            proc = subprocess.run(
+                command,
+                input=payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=CLARITY_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.message = "Clarity: could not run analyzer"
+            return
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", errors="replace").strip()
+            if detail:
+                # Tracebacks are multiline; the final line is normally the useful
+                # exception summary.  Keep the status terse but stop hiding the
+                # reason the semantic lens failed.
+                detail = detail.splitlines()[-1].strip()
+                if len(detail) > 120:
+                    detail = detail[:117] + "..."
+                self.message = f"Clarity: analyzer exited {proc.returncode}: {detail}"
+            else:
+                self.message = f"Clarity: analyzer exited {proc.returncode}"
+            return
+        try:
+            result = json.loads(proc.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.message = "Clarity: analyzer returned invalid JSON"
+            return
+
+        visible_end = visible_start + visible_span
+        views = []
+        annotations = []
+        for view in result.get("views", []):
+            start = int(view.get("offset", -1))
+            end = start + int(view.get("extent", 0))
+            if start < visible_end and end > visible_start:
+                views.append(view)
+                for row in view.get("annotations", []):
+                    a_start = int(row.get("start", -1))
+                    a_end = int(row.get("end", -1))
+                    if a_start < visible_end and a_end > visible_start and a_end > a_start:
+                        annotations.append(row)
+
+        self.clarity_views = views
+        self.clarity_annotations = annotations
+        self.clarity_analysis_range = (analysis_start, analysis_end)
+        self.clarity_active = bool(views)
+        self.rebuild_clarity_cell_states()
+        if not views:
+            self.message = "Clarity: no recognized structure in this view"
+            return
+
+        strong = sum(bool(view.get("strong_identity")) for view in views)
+        partial = len(views) - strong
+        pieces = []
+        if strong:
+            pieces.append(f"{strong} strong")
+        if partial:
+            pieces.append(f"{partial} partial")
+        self.message = "Clarity semantic view: " + ", ".join(pieces) + " structural view(s)"
+
+    def clarity_annotation_at(self, addr: int) -> Optional[dict]:
+        if not self.clarity_active:
+            return None
+        matches = [
+            row for row in self.clarity_annotations
+            if int(row.get("start", -1)) <= addr < int(row.get("end", -1))
+        ]
+        if not matches:
+            return None
+        # Deepest/smallest annotation is the most useful cursor label.
+        return max(
+            matches,
+            key=lambda row: (int(row.get("depth", 0)), -(
+                int(row.get("end", 0)) - int(row.get("start", 0))
+            )),
+        )
+
+    @staticmethod
+    def _clarity_field_label(row: dict) -> str:
+        return str(row.get("label") or row.get("path") or "field")
+
+    def _clarity_semantic_fields(self) -> List[dict]:
+        """Return the coherent structural frontier FatPix should color.
+
+        Clarity's generic KSY projector keeps hierarchy instead of flattening every
+        nested member into ``kind=field``.  Root fields remain ``field``; immediate
+        members of repeated records and out-of-line instances are ``subfield`` (or
+        ``bitfield``), and deeper encoding details remain below those.
+
+        FatPix wants the first useful semantic layer, not every leaf at once.  Keep
+        ordinary fields/payloads, expose the immediate fields of records/instances,
+        and descend one level through a top-level wrapper field.  This restores the
+        MBR partition grammar (status / CHS / type / CHS / LBA / size) without
+        exploding each CHS coordinate into head/b2/b3 colors.
+        """
+        rows = self.clarity_annotations
+        by_path = {str(row.get("path", "")): row for row in rows if row.get("path")}
+        out: List[dict] = []
+        seen = set()
+
+        for row in rows:
+            kind = row.get("kind")
+            include = kind in {"field", "payload"}
+            if kind in {"subfield", "bitfield"}:
+                path = str(row.get("path", ""))
+                parent_path = path.rsplit(".", 1)[0] if "." in path else ""
+                parent = by_path.get(parent_path)
+                if parent is not None:
+                    parent_kind = parent.get("kind")
+                    parent_depth = int(parent.get("depth", 0))
+                    include = (
+                        parent_kind in {"record", "instance"}
+                        or (parent_kind == "field" and parent_depth <= 1)
+                    )
+
+            if include:
+                key = (
+                    int(row.get("start", -1)),
+                    int(row.get("end", -1)),
+                    str(row.get("path", "")),
+                    str(kind),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    out.append(row)
+        return out
+
+    def _clarity_semantic_annotation_at(self, addr: int) -> Optional[dict]:
+        matches = [
+            row for row in self._clarity_semantic_fields()
+            if int(row.get("start", -1)) <= addr < int(row.get("end", -1))
+        ]
+        if not matches:
+            return None
+        return max(
+            matches,
+            key=lambda row: (int(row.get("depth", 0)), -(
+                int(row.get("end", 0)) - int(row.get("start", 0))
+            )),
+        )
+
+    def _build_clarity_palette(self) -> None:
+        """Assign one stable FatPix color to each visible structural field type.
+
+        Repeated labels are assigned first.  For MBR this mechanically yields the
+        especially legible status=red, chs_start=orange, partition_type=yellow,
+        chs_end=green, lba_start=blue, num_sectors=purple pattern; singleton
+        bootstrap/signature fields then receive brown and white.  No byte value
+        participates in this choice.
+        """
+        fields = self._clarity_semantic_fields()
+        counts: Dict[str, int] = {}
+        first: Dict[str, Tuple[int, int]] = {}
+        span: Dict[str, int] = {}
+        for order, row in enumerate(fields):
+            label = self._clarity_field_label(row)
+            counts[label] = counts.get(label, 0) + 1
+            first.setdefault(label, (int(row.get("start", 0)), order))
+            span.setdefault(label, max(1, int(row.get("end", 0)) - int(row.get("start", 0))))
+
+        repeated = sorted((k for k, n in counts.items() if n > 1), key=lambda k: first[k])
+        singleton = sorted((k for k, n in counts.items() if n == 1), key=lambda k: first[k])
+        labels = repeated + singleton
+        self.clarity_palette = {
+            label: CLARITY_SEMANTIC_PALETTE[i % len(CLARITY_SEMANTIC_PALETTE)]
+            for i, label in enumerate(labels)
+        }
+        self.clarity_legend_entries = [
+            (label, self.clarity_palette[label], min(4, span[label]))
+            for label in labels
+        ]
+
+    def rebuild_clarity_cell_states(self) -> None:
+        """Project Clarity fields into a coherent semantic FatPix lens.
+
+        A recognized field *replaces* the byte/lens color for that cell.  The
+        normal FatPix rendering remains untouched outside recognized structure.
+        A matching circle marks a genuine field start; it is never introduced
+        merely because a structure begins at the viewport edge.
+
+        At coarse scales, the field occupying the most bytes in a fat pixel wins.
+        Any real field transition inside that pixel still turns it into a circle.
+        """
+        self.clarity_cell_states = [[(None, False) for _ in range(self.w)] for _ in range(self.h)]
+        self.clarity_palette = {}
+        self.clarity_legend_entries = []
+        if not self.clarity_active or not self.clarity_annotations or not self.file_mode:
+            return
+
+        self._build_clarity_palette()
+        fields = [
+            row for row in self._clarity_semantic_fields()
+            if self._clarity_field_label(row) in self.clarity_palette
+        ]
+        if not fields:
+            return
+
+        cells = self.w * self.h
+        if cells <= 0:
+            return
+        scale = max(1, int(self.file_bytes_per_cell))
+        view_start = int(self.file_view_start)
+        view_end = view_start + cells * scale
+
+        flat_color: List[Optional[int]] = [None] * cells
+        flat_boundary = [False] * cells
+        best: List[Tuple[int, int, int]] = [(-1, -1, 0)] * cells
+
+        for row in fields:
+            a_start = int(row.get("start", -1))
+            a_end = int(row.get("end", -1))
+            if a_end <= a_start or a_start >= view_end or a_end <= view_start:
+                continue
+            label = self._clarity_field_label(row)
+            color = self.clarity_palette[label]
+            depth = int(row.get("depth", 0))
+            span = a_end - a_start
+            clipped_start = max(a_start, view_start)
+            clipped_end = min(a_end, view_end)
+            first_i = max(0, min(cells - 1, (clipped_start - view_start) // scale))
+            last_i = max(0, min(cells - 1, (clipped_end - 1 - view_start) // scale))
+            for i in range(first_i, last_i + 1):
+                c_start = view_start + i * scale
+                c_end = c_start + scale
+                overlap = max(0, min(a_end, c_end) - max(a_start, c_start))
+                score = (overlap, depth, -span)
+                if score > best[i]:
+                    best[i] = score
+                    flat_color[i] = color
+
+            if view_start <= a_start < view_end:
+                i = (a_start - view_start) // scale
+                if 0 <= i < cells:
+                    flat_boundary[i] = True
+
+        for y in range(self.h):
+            base = y * self.w
+            self.clarity_cell_states[y] = [
+                (flat_color[i], flat_boundary[i])
+                for i in range(base, base + self.w)
+            ]
+
+    def clarity_cell_state(self, x: int, y: int) -> Tuple[Optional[int], bool]:
+        if not self.clarity_active or not self.clarity_cell_states:
+            return None, False
+        if not (0 <= y < len(self.clarity_cell_states)):
+            return None, False
+        row = self.clarity_cell_states[y]
+        if not (0 <= x < len(row)):
+            return None, False
+        return row[x]
+
+    def toggle_clarity_legend(self) -> None:
+        if not self.clarity_enabled:
+            self.message = "Clarity is off; press C first"
+            return
+        if not self.clarity_active or not self.clarity_legend_entries:
+            self.message = "Clarity: no legend for this view"
+            return
+        self.clarity_legend_open = not self.clarity_legend_open
+        self.message = "Clarity legend " + ("on" if self.clarity_legend_open else "off")
+
+    def _clarity_legend_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        if not (self.file_mode and self.clarity_active and self.clarity_legend_open and self.clarity_legend_entries):
+            return None
+        labels = [label for label, _, _ in self.clarity_legend_entries]
+        width = min(max(24, max(len(label) for label in labels) + 12), max(8, self.term_cols - 2))
+        height = min(len(self.clarity_legend_entries) + 2, max(3, self.h))
+        cursor_col = self.cursor_x * self.cell_w + 1
+        left = 2 if cursor_col > self.term_cols // 2 else max(1, self.term_cols - width)
+        top = 1
+        inspector = self._inspector_rect()
+        if inspector is not None:
+            i_left, i_top, i_width, i_height = inspector
+            overlaps = not (left + width <= i_left or i_left + i_width <= left or top + height <= i_top or i_top + i_height <= top)
+            if overlaps:
+                top = max(1, self.h - height + 1)
+        return left, top, width, height
+
+    def render_clarity_legend(self) -> str:
+        rect = self._clarity_legend_rect()
+        if rect is None:
+            return ""
+        left, top, width, height = rect
+        inner_w = max(6, width - 2)
+        current = self._clarity_semantic_annotation_at(self.file_cursor_addr)
+        current_label = self._clarity_field_label(current) if current is not None else None
+        title = " CLARITY LEGEND "
+        top_border = "+" + title[:inner_w].ljust(inner_w, "-") + "+"
+        lines = [top_border]
+        room = max(0, height - 2)
+        for label, color, swatch_len in self.clarity_legend_entries[:room]:
+            mark = GLYPHS[color] * max(1, swatch_len)
+            name = label
+            if label == current_label:
+                name = f"\x1b[1m{label}\x1b[22m"
+            lines.append("|" + pad_line(f"{name}  {mark}", inner_w) + "|")
+        while len(lines) < height - 1:
+            lines.append("|" + " " * inner_w + "|")
+        footer = " c close "
+        lines.append("+" + footer[:inner_w].ljust(inner_w, "-") + "+")
+        out: List[str] = []
+        for i, line in enumerate(lines):
+            out.append(f"\x1b[{top + i};{left}H\x1b[0;97;40m{line}\x1b[0m")
+        return "".join(out)
+
+    def _mouse_file_cell(self, term_x: int, term_y: int) -> Optional[Tuple[int, int]]:
+        # SGR mouse coordinates are 1-based terminal character cells. FatPix
+        # squares are two terminal columns wide and one row tall.
+        if not (1 <= term_y <= self.h and 1 <= term_x <= self.w * self.cell_w):
+            return None
+        rect = self._inspector_rect()
+        if rect is not None:
+            left, top, width, height = rect
+            if left <= term_x < left + width and top <= term_y < top + height:
+                return None
+        x = (term_x - 1) // self.cell_w
+        y = term_y - 1
+        if 0 <= x < self.w and 0 <= y < self.h:
+            return x, y
+        return None
+
+    def select_file_cell(self, x: int, y: int, extend: bool = False) -> None:
+        if not self.file_mode or not (0 <= y < len(self.file_cell_info)):
+            return
+        row = self.file_cell_info[y]
+        if not (0 <= x < len(row)):
+            return
+        info = row[x]
+        if info is None or info["span"] <= 0:
+            return
+        cell_start = info["start"]
+        cell_end = cell_start + info["span"]
+
+        if not extend or self.file_selection_anchor is None:
+            self.file_selection_anchor = (cell_start, cell_end)
+        anchor_start, anchor_end = self.file_selection_anchor
+        self.file_selection_start = min(anchor_start, cell_start)
+        self.file_selection_end = max(anchor_end, cell_end)
+
+        if cell_start != self.file_cursor_addr:
+            self.capture_inspector_baseline()
+        self.file_cursor_addr = cell_start
+        self.cursor_x, self.cursor_y = x, y
+        if self.inspect_open:
+            # A coarse cell's inspector intentionally shows the representative
+            # sample from its middle, not necessarily the cell's first byte.
+            self._set_inspect_focus(self._cell_inspection_start(info))
+        if self.file_lens == 6:
+            self.recolor_file_grid()
+
+        length = self.file_selection_end - self.file_selection_start
+        self.message = (
+            f"selected 0x{self.file_selection_start:x}..0x{self.file_selection_end:x} "
+            f"({human_size(length)})"
+        )
+
+    def clear_file_selection(self) -> None:
+        self.file_selection_anchor = None
+        self.file_selection_start = None
+        self.file_selection_end = None
+        self.file_mouse_dragging = False
+        self.message = "selection cleared"
+
+    def file_cell_is_selected(self, info: Optional[dict]) -> bool:
+        if (
+            info is None
+            or info.get("span", 0) <= 0
+            or self.file_selection_start is None
+            or self.file_selection_end is None
+        ):
+            return False
+        cell_start = info["start"]
+        cell_end = cell_start + info["span"]
+        return cell_start < self.file_selection_end and cell_end > self.file_selection_start
+
+    def handle_mouse(self, event: tuple) -> None:
+        if not self.file_mode or len(event) != 5:
+            return
+        _, code, term_x, term_y, final = event
+
+        # SGR wheel events arrive once mouse reporting is enabled. Keep the
+        # terminal's old scroll-as-navigation feel instead of swallowing them.
+        if code & 64:
+            wheel = code & 1
+            self.move_file_cursor(0, 3 if wheel else -3)
+            return
+
+        button = code & 3
+        motion = bool(code & 32)
+        cell = self._mouse_file_cell(term_x, term_y)
+
+        if final == "m":
+            if self.file_mouse_dragging and cell is not None:
+                self.select_file_cell(cell[0], cell[1], extend=True)
+            self.file_mouse_dragging = False
+            return
+
+        if button != 0:
+            return
+        if motion:
+            if self.file_mouse_dragging and cell is not None:
+                self.select_file_cell(cell[0], cell[1], extend=True)
+            return
+        if cell is not None:
+            self.file_mouse_dragging = True
+            self.select_file_cell(cell[0], cell[1], extend=False)
+
+    def dump_file_selection(self, filename: str) -> None:
+        if not self.file_mode or self.file_source is None:
+            raise ValueError("dump is only available in file view")
+        if self.file_selection_start is None or self.file_selection_end is None:
+            raise ValueError("nothing selected; click or drag fat pixels first")
+        if not filename:
+            raise ValueError("dump needs a filename")
+        if self.file_source.path is not None:
+            if os.path.abspath(filename) == os.path.abspath(self.file_source.path):
+                raise ValueError("refusing to overwrite the source")
+
+        start = self.file_selection_start
+        end = min(self.file_selection_end, self.file_source.size)
+        remaining = max(0, end - start)
+        total = remaining
+        offset = start
+        with open(filename, "wb") as out:
+            while remaining:
+                chunk = self.file_source.read(offset, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise OSError(f"short read at 0x{offset:x}")
+                out.write(chunk)
+                offset += len(chunk)
+                remaining -= len(chunk)
+        # Do not echo the destination path; --private should not have to guess
+        # which user-chosen dump names are sensitive.
+        self.message = f"dumped {human_size(total)} selection"
+
+    def jump_file_cursor_half_page(self, direction: int) -> None:
+        if not self.file_mode:
+            return
+        # Move by half the currently visible logical cells.  Keeping the jump
+        # cell-aligned preserves an exact cursor's within-cell position while
+        # leaving roughly half the old view on screen as an orientation anchor.
+        half_cells = max(1, (self.w * self.h) // 2)
+        delta = half_cells * self.file_bytes_per_cell
+        before = self.file_cursor_addr
+        self.move_file_cursor_bytes(delta if direction > 0 else -delta)
+        moved = abs(self.file_cursor_addr - before)
+        if moved:
+            name = "down" if direction > 0 else "up"
+            self.message = f"half-page {name} {human_size(moved)}"
+
+    def zoom_file(self, inward: bool) -> None:
+        if not self.file_mode:
+            return
+        old = self.file_bytes_per_cell
+        if inward:
+            pos = bisect.bisect_left(FILE_SCALE_LADDER, old)
+            new = FILE_SCALE_LADDER[max(0, pos - 1)]
+        else:
+            pos = bisect.bisect_right(FILE_SCALE_LADDER, old)
+            new = FILE_SCALE_LADDER[pos] if pos < len(FILE_SCALE_LADDER) else old
+        if new == old:
+            self.message = "already at zoom limit"
+            return
+        if self.inspect_open and self.inspect_focus_addr is not None:
+            # Zoom toward the exact bytes currently visible in the inspector.
+            # Without this, a multi-megabyte cell zoomed toward its cell start
+            # while HEX/TEXT were showing a centered 1 KiB representative
+            # sample, so the interesting bytes could disappear immediately.
+            self.file_cursor_addr = self.inspect_focus_addr
+        self.file_bytes_per_cell = new
+        self.invalidate_inspector_baseline()
+        self.center_file_on_cursor()
+        self.refresh_file_grid()
+        self.message = f"scale {human_size(self.file_bytes_per_cell)}/cell"
+
+    def goto_file_offset(self, offset: int) -> None:
+        assert self.file_source is not None
+        if not 0 <= offset < self.file_source.size:
+            raise ValueError(f"offset outside source (size {self.file_source.size})")
+        if offset != self.file_cursor_addr:
+            self.capture_inspector_baseline()
+        self.file_cursor_addr = offset
+        if self.inspect_open:
+            self._set_inspect_focus(offset)
+        self.center_file_on_cursor()
+        self.refresh_file_grid()
+        self.message = f"goto 0x{offset:x}"
+
+    def set_file_scale(self, scale: int) -> None:
+        if scale < 1:
+            raise ValueError("scale must be >= 1 byte")
+        if scale != self.file_bytes_per_cell:
+            self.invalidate_inspector_baseline()
+        if self.inspect_open and self.inspect_focus_addr is not None:
+            self.file_cursor_addr = self.inspect_focus_addr
+        self.file_bytes_per_cell = scale
+        self.center_file_on_cursor()
+        self.refresh_file_grid()
+        self.message = f"scale {human_size(scale)}/cell"
+
+    def set_file_lens(self, lens: int) -> None:
+        if lens not in FILE_LENSES:
+            raise ValueError("view must be 1 through 6")
+        self.file_lens = lens
+        # Lenses operate on the samples already loaded for the current viewport.
+        # Switching views therefore causes no disk I/O.
+        self.recolor_file_grid()
+        self.message = f"view {lens}: {FILE_LENSES[lens]}"
+
+    def invalidate_inspector_baseline(self) -> None:
+        self.inspect_prev_data = None
+        self.inspect_prev_data_start = None
+        self.inspect_prev_scale = None
+
+    def capture_inspector_baseline(self) -> None:
+        if not (self.file_mode and self.inspect_open):
+            return
+        info, data, data_start, _ = self._inspection_data()
+        if info is None:
+            self.invalidate_inspector_baseline()
+            return
+        self.inspect_prev_data = bytes(data)
+        self.inspect_prev_data_start = data_start
+        self.inspect_prev_scale = self.file_bytes_per_cell
+
+    def toggle_inspector(self) -> None:
+        if not self.file_mode:
+            return
+        self.inspect_open = not self.inspect_open
+        self.invalidate_inspector_baseline()
+        if self.inspect_open:
+            info = self.current_file_info()
+            self._set_inspect_focus(
+                self._cell_inspection_start(info) if info is not None else self.file_cursor_addr
+            )
+        else:
+            self._set_inspect_focus(None)
+        self.message = "inspector open" if self.inspect_open else "inspector closed"
+
+    def change_inspector_page(self, delta: int) -> None:
+        if not self.inspect_open:
+            return
+        self.inspect_page = (self.inspect_page + delta) % len(self.inspect_pages)
+        self.message = f"inspect {self.inspect_pages[self.inspect_page].lower()}"
+
+    def _inspection_data(self) -> Tuple[Optional[dict], bytes, int, str]:
+        info = self.current_file_info()
+        if info is None:
+            return None, b"", 0, "no selected cell"
+        assert self.file_source is not None
+        span = info["span"]
+        natural_start = self._cell_inspection_start(info)
+        data_start = (
+            self.inspect_focus_addr
+            if self.inspect_open and self.inspect_focus_addr is not None
+            else natural_start
+        )
+
+        # Preserve the old inspector sizes: tiny cells get a 256-byte context,
+        # medium cells show their full cell sample, huge cells show 1 KiB.
+        want = 256 if span < 256 else min(1024, span)
+        if data_start == natural_start:
+            data = info["context"] or info["sample"]
+        else:
+            key = (data_start, want)
+            if key != self.inspect_data_cache_key:
+                self.inspect_data_cache = self.file_source.read(data_start, want)
+                self.inspect_data_cache_key = key
+            data = self.inspect_data_cache
+
+        if span < 256:
+            note = f"context {len(data)}B from focus"
+        else:
+            note = f"sample {len(data)}B"
+            if span > len(data):
+                note += f" of {human_size(span)} cell"
+        return info, data, data_start, note
+
+    @staticmethod
+    def _ascii_preview(data: bytes) -> str:
+        return "".join(chr(b) if 32 <= b <= 126 else "." for b in data)
+
+    @staticmethod
+    def _hex_compact(data: bytes, limit: int = 16) -> str:
+        shown = data[:limit]
+        text = " ".join(f"{b:02x}" for b in shown)
+        if len(data) > limit:
+            text += " ..."
+        return text
+
+    @staticmethod
+    def _printable_runs(data: bytes, minimum: int = 4) -> List[Tuple[int, bytes]]:
+        runs: List[Tuple[int, bytes]] = []
+        start: Optional[int] = None
+        for i, b in enumerate(data + b"\x00"):
+            printable = 32 <= b <= 126 or b == 9
+            if printable and start is None:
+                start = i
+            elif not printable and start is not None:
+                if i - start >= minimum:
+                    runs.append((start, data[start:i]))
+                start = None
+        return runs
+
+    @staticmethod
+    def _magic_hits(data: bytes, data_start: int) -> List[Tuple[int, str]]:
+        signatures = (
+            (b"%PDF-", "PDF header"),
+            (b"\x89PNG\r\n\x1a\n", "PNG signature"),
+            (b"\x7fELF", "ELF header"),
+            (b"PK\x03\x04", "ZIP local header"),
+            (b"PK\x05\x06", "ZIP end directory"),
+            (b"\x1f\x8b\x08", "gzip header"),
+            (b"SQLite format 3\x00", "SQLite header"),
+            (b"RIFF", "RIFF header"),
+            (b"ID3", "ID3 header"),
+            (b"\xff\xd8\xff", "JPEG header"),
+        )
+        hits: List[Tuple[int, str]] = []
+        for sig, label in signatures:
+            pos = 0
+            while True:
+                pos = data.find(sig, pos)
+                if pos < 0:
+                    break
+                hits.append((data_start + pos, label))
+                pos += 1
+        for i in range(max(0, len(data) - 1)):
+            absolute = data_start + i
+            if absolute % 512 == 510 and data[i:i + 2] == b"\x55\xaa":
+                hits.append((absolute, "boot-sector 55 aa signature"))
+            if i + 1 < len(data):
+                cmf, flg = data[i], data[i + 1]
+                if (cmf & 0x0f) == 8 and (cmf >> 4) <= 7 and ((cmf << 8) + flg) % 31 == 0:
+                    hits.append((absolute, "possible zlib header"))
+        hits.sort(key=lambda item: item[0])
+        return hits
+
+    def inspector_lines(self, width: int, content_height: int) -> List[str]:
+        info, data, data_start, note = self._inspection_data()
+        page = self.inspect_pages[self.inspect_page]
+        if info is None:
+            return ["no selected file cell"]
+
+        lines: List[str] = []
+        if page == "HEX":
+            lines.append(f"{note}; data starts 0x{data_start:x}")
+            bytes_per_line = 8 if width < 58 else 12
+            max_rows = max(1, content_height - 1)
+            for row in range(max_rows):
+                off = row * bytes_per_line
+                chunk = data[off: off + bytes_per_line]
+                if not chunk:
+                    break
+                hx = " ".join(f"{b:02x}" for b in chunk)
+                asc = self._ascii_preview(chunk)
+                lines.append(f"{data_start + off:08x}  {hx:<{bytes_per_line * 3 - 1}}  |{asc}|")
+
+        elif page == "DIFF HEX":
+            previous = self.inspect_prev_data
+            previous_start = self.inspect_prev_data_start
+            if previous is None or previous_start is None or self.inspect_prev_scale != self.file_bytes_per_cell:
+                lines.append("no comparable previous cursor sample; move cursor once")
+                lines.append(f"current: {note}; data starts 0x{data_start:x}")
+            else:
+                compared = min(len(data), len(previous))
+                changed_total = sum(1 for i in range(compared) if data[i] != previous[i])
+                changed_total += abs(len(data) - len(previous))
+                lines.append(
+                    f"current 0x{data_start:x} vs previous 0x{previous_start:x}; "
+                    f"changed {changed_total}/{max(len(data), len(previous))} B"
+                )
+                bytes_per_line = 8 if width < 58 else 12
+                max_rows = max(1, content_height - 1)
+                base = "\x1b[0;97;40m"
+                dim = "\x1b[90m"
+                bright = "\x1b[1;97m"
+                for row in range(max_rows):
+                    off = row * bytes_per_line
+                    chunk = data[off: off + bytes_per_line]
+                    if not chunk:
+                        break
+                    hex_parts: List[str] = []
+                    ascii_parts: List[str] = []
+                    for i, b in enumerate(chunk):
+                        rel = off + i
+                        changed = rel >= len(previous) or b != previous[rel]
+                        style = bright if changed else dim
+                        hex_parts.append(f"{style}{b:02x}{base}")
+                        ch = chr(b) if 32 <= b <= 126 else "."
+                        ascii_parts.append(f"{style}{ch}{base}")
+                    hx = " ".join(hex_parts)
+                    missing = bytes_per_line - len(chunk)
+                    if missing:
+                        hx += " " * (missing * 3)
+                    asc = "".join(ascii_parts)
+                    lines.append(f"{data_start + off:08x}  {hx}  |{asc}|")
+
+        elif page == "TEXT":
+            lines.append(f"printable runs in {note} @ 0x{data_start:x}")
+            runs = self._printable_runs(data)
+            if not runs:
+                lines.append("no ASCII runs >= 4 bytes")
+            for rel, run in runs[: max(1, content_height - 1)]:
+                text = run.decode("ascii", errors="replace").replace("\t", "\\t")
+                room = max(8, width - 17)
+                if len(text) > room:
+                    text = text[: max(1, room - 3)] + "..."
+                lines.append(f"+0x{rel:04x} 0x{data_start + rel:08x}  {text!r}")
+
+        elif page == "NUM":
+            if data_start <= self.file_cursor_addr < data_start + len(data):
+                rel = self.file_cursor_addr - data_start
+            else:
+                rel = 0
+            raw = data[rel: rel + 8]
+            absolute = data_start + rel
+            lines.append(f"anchor=0x{absolute:x} bytes={self._hex_compact(raw, 8)}")
+            if raw:
+                lines.append(f"u8={raw[0]}  i8={struct.unpack('b', raw[:1])[0]}")
+            if len(raw) >= 2:
+                lines.append(f"u16 le={int.from_bytes(raw[:2], 'little')}  be={int.from_bytes(raw[:2], 'big')}")
+                lines.append(f"i16 le={int.from_bytes(raw[:2], 'little', signed=True)}  be={int.from_bytes(raw[:2], 'big', signed=True)}")
+            if len(raw) >= 4:
+                lines.append(f"u32 le={int.from_bytes(raw[:4], 'little')}  be={int.from_bytes(raw[:4], 'big')}")
+                lines.append(f"i32 le={int.from_bytes(raw[:4], 'little', signed=True)}  be={int.from_bytes(raw[:4], 'big', signed=True)}")
+                f_le = struct.unpack("<f", raw[:4])[0]
+                f_be = struct.unpack(">f", raw[:4])[0]
+                lines.append(f"f32 le={f_le:.7g}  be={f_be:.7g}")
+            if len(raw) >= 8:
+                lines.append(f"u64 le={int.from_bytes(raw[:8], 'little')}  be={int.from_bytes(raw[:8], 'big')}")
+                d_le = struct.unpack("<d", raw[:8])[0]
+                d_be = struct.unpack(">d", raw[:8])[0]
+                lines.append(f"f64 le={d_le:.7g}  be={d_be:.7g}")
+
+        elif page == "MAGIC":
+            lines.append(f"cheap signature scan in {note} @ 0x{data_start:x}")
+            hits = self._magic_hits(data, data_start)
+            if not hits:
+                lines.append("no known signatures in sampled bytes")
+            for absolute, label in hits[: max(1, content_height - 1)]:
+                lines.append(f"0x{absolute:08x}  {label}")
+            if len(hits) > max(1, content_height - 1):
+                lines.append(f"... {len(hits) - (content_height - 1)} more")
+
+        elif page == "STATS":
+            packed = zlib.compress(data, 1) if data else b""
+            ratio = (len(packed) / len(data)) if data else 0.0
+            counts = Counter(data)
+            common = counts.most_common(6)
+            lines.extend([
+                f"cell={human_size(info['span'])}  {note} @ 0x{data_start:x}",
+                f"entropy={info['entropy']:.3f} bits/B  unique={info['unique']}",
+                f"zero={info['zero']:.2%}  ff={info['ff']:.2%}  printable={info['printable']:.2%}",
+                f"zlib/raw={ratio:.2%} ({len(packed)}/{len(data)} bytes)",
+                f"lens={self.file_lens}:{FILE_LENSES[self.file_lens]}  {info.get('lens_detail', '')}",
+            ])
+            if common:
+                lines.append("top bytes: " + " ".join(f"{b:02x}:{n}" for b, n in common))
+
+        elif page == "RANGE":
+            end = info["start"] + info["span"]
+            sample_end = data_start + len(data)
+            row_stride = self.w * self.file_bytes_per_cell
+            lines.extend([
+                f"cell  0x{info['start']:x}..0x{end:x}  ({human_size(info['span'])})",
+                f"sample 0x{data_start:x}..0x{sample_end:x}  ({len(data)} B)",
+                f"cursor=0x{self.file_cursor_addr:x}  screen={self.cursor_x},{self.cursor_y}",
+                f"scale={human_size(self.file_bytes_per_cell)}/cell  row={human_size(row_stride)}",
+                f"head: {self._hex_compact(data[:16], 16)}",
+                f"tail: {self._hex_compact(data[-16:], 16) if data else ''}",
+                f"source size={human_size(self.file_source.size if self.file_source else 0)}",
+            ])
+
+        return [fit_line(line, width) for line in lines[:content_height]]
+
+    def render_inspector_overlay(self) -> str:
+        if not (self.file_mode and self.inspect_open):
+            return ""
+        # Render-time overlay only: self.grid and byte-to-cell geometry are untouched.
+        rect = self._inspector_rect()
+        assert rect is not None
+        left, top, width, height = rect
+        inner_w = max(6, width - 2)
+        content_h = max(1, height - 2)
+
+        page = self.inspect_pages[self.inspect_page]
+        title = f" INSPECT {page} {self.inspect_page + 1}/{len(self.inspect_pages)} "
+        top_border = "+" + title[:inner_w].ljust(inner_w, "-") + "+"
+        body = self.inspector_lines(inner_w, content_h)
+        footer = " ,/. page  i/Esc close  ? help "
+        bottom_border = "+" + footer[:inner_w].ljust(inner_w, "-") + "+"
+
+        lines = [top_border]
+        for i in range(content_h):
+            text = body[i] if i < len(body) else ""
+            lines.append("|" + pad_line(text, inner_w) + "|")
+        lines.append(bottom_border)
+
+        out: List[str] = []
+        for i, line in enumerate(lines):
+            out.append(f"\x1b[{top + i};{left}H\x1b[0;97;40m{line}\x1b[0m")
+        return "".join(out)
+
+    def open_help(self) -> None:
+        self.help_restore_animate = self.animate
+        self.animate = False
+        self.show_help = True
+
+    def close_help(self) -> None:
+        self.show_help = False
+        if self.help_restore_animate is not None:
+            self.animate = self.help_restore_animate
+        self.help_restore_animate = None
+
+    def normalize_marquee_text(self, text: str) -> str:
+        text = text.replace("\t", "   ")
+        lines = []
+        for line in text.splitlines():
+            lines.append("".join(ch if ch >= " " else " " for ch in line))
+        if not lines and text:
+            lines = [text]
+        # A large blank gap turns multiple input lines into consecutive messages.
+        return ("     ".join(lines).strip())[:MAX_MARQUEE_CHARS]
+
+    def build_marquee_columns(self, text: str) -> List[Tuple[int, ...]]:
+        columns: List[Tuple[int, ...]] = []
+        for ch in text.upper():
+            rows = FONT_5X7.get(ch, FONT_5X7["?"])
+            if ch == " ":
+                columns.extend([EMPTY_FONT_COLUMN] * 3)
+                continue
+            for x in range(5):
+                columns.append(tuple(1 if rows[y][x] == "1" else 0 for y in range(7)))
+            columns.append(EMPTY_FONT_COLUMN)
+        return columns
+
+    def set_marquee_text(self, text: str) -> None:
+        normalized = self.normalize_marquee_text(text)
+        if not normalized:
+            raise ValueError("text needs a visible message")
+        self.marquee_text = normalized
+        self.marquee_columns = self.build_marquee_columns(normalized)
+        self.marquee_x = self.w
+        self.mode = "marquee"
+        self.animate = True
+        suffix = " (truncated)" if len(normalized) >= MAX_MARQUEE_CHARS else ""
+        self.message = f"marquee: {normalized[:40]}{suffix}"
+
+    def resize_to_terminal(self, cols: int, rows: int) -> None:
+        new_w = max(8, cols // self.cell_w)
+        new_h = max(4, rows - self.status_lines)
+        if new_w == self.w and new_h == self.h and cols == self.term_cols and rows == self.term_rows:
+            return
+        old = self.grid
+        old_w, old_h = self.w, self.h
+        new = [[0 for _ in range(new_w)] for _ in range(new_h)]
+        copy_w = min(old_w, new_w)
+        copy_h = min(old_h, new_h)
+        # Preserve top-left. This makes terminal resizing feel like revealing/cropping wall area.
+        for y in range(copy_h):
+            new[y][:copy_w] = old[y][:copy_w]
+        self.term_cols, self.term_rows = cols, rows
+        self.w, self.h = new_w, new_h
+        self.grid = new
+        self.cursor_x = clamp(self.cursor_x, 0, self.w - 1)
+        self.cursor_y = clamp(self.cursor_y, 0, self.h - 1)
+        if self.file_mode:
+            self.center_file_on_cursor()
+            self.refresh_file_grid()
+            self.message = f"resized terminal -> file matrix {self.w}x{self.h}"
+        else:
+            self.message = f"resized terminal -> matrix {self.w}x{self.h} fat pixels"
+
+    def clear(self, color: int = 0) -> None:
+        self.grid = [[color for _ in range(self.w)] for _ in range(self.h)]
+
+    def fill(self, color: int) -> None:
+        self.clear(color)
+
+    def paint(self, x: int, y: int, color: int) -> None:
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.grid[y][x] = color
+
+    def noise(self, density: float = 1.0, colors: Optional[List[int]] = None) -> None:
+        density = max(0.0, min(1.0, density))
+        colors = colors or list(range(len(GLYPHS)))
+        for y in range(self.h):
+            row = self.grid[y]
+            for x in range(self.w):
+                if random.random() < density:
+                    row[x] = random.choice(colors)
+
+    def step(self) -> None:
+        if not self.animate:
+            return
+        if self.mode == "wave":
+            self.step_wave()
+        elif self.mode == "drip":
+            self.step_drip()
+        elif self.mode == "rain":
+            self.step_rain()
+        elif self.mode == "spark":
+            self.step_spark()
+        elif self.mode == "marquee":
+            self.step_marquee()
+        self.tick += 1
+
+    def step_wave(self) -> None:
+        # Full-wall field animation. It deliberately updates hundreds/thousands of cells.
+        colors = [3, 6, 5, 4, 2, 7]
+        t = self.tick * 0.23
+        cx = self.w / 2.0
+        cy = self.h / 2.0
+        for y in range(self.h):
+            row = self.grid[y]
+            for x in range(self.w):
+                dx = (x - cx) / max(1.0, self.w)
+                dy = (y - cy) / max(1.0, self.h)
+                r = math.sqrt(dx * dx + dy * dy) * 18.0
+                v = math.sin((x * 0.22) + t) + math.sin((y * 0.31) - t * 0.7) + math.sin(r - t * 1.4)
+                row[x] = colors[int(((v + 3.0) / 6.0) * len(colors)) % len(colors)]
+
+    def step_drip(self) -> None:
+        # Cellular slime/rain. Top line injects color; board falls and smears.
+        for y in range(self.h - 1, 0, -1):
+            src = self.grid[y - 1]
+            dst = self.grid[y]
+            for x in range(self.w):
+                if random.random() < 0.80:
+                    nx = clamp(x + random.choice([-1, 0, 0, 0, 1]), 0, self.w - 1)
+                    dst[x] = src[nx]
+                elif random.random() < 0.04:
+                    dst[x] = 0
+        hot = [2, 4, 5, 6, 7]
+        for x in range(self.w):
+            if random.random() < 0.18:
+                self.grid[0][x] = random.choice(hot)
+            elif random.random() < 0.30:
+                self.grid[0][x] = 0
+
+    def step_rain(self) -> None:
+        # Sparse falling trails. Chunky terminal Matrix/Lite-Brite vibe.
+        for y in range(self.h - 1, 0, -1):
+            for x in range(self.w):
+                above = self.grid[y - 1][x]
+                if above != 0 and random.random() < 0.75:
+                    self.grid[y][x] = above
+                elif self.grid[y][x] != 0 and random.random() < 0.25:
+                    self.grid[y][x] = 0
+        for x in range(self.w):
+            if random.random() < 0.055:
+                self.grid[0][x] = random.choice([3, 6, 5, 7, 1])
+            elif random.random() < 0.25:
+                self.grid[0][x] = 0
+
+    def step_spark(self) -> None:
+        # Diffuse/decay sparks. Index is used as intensity-ish, mapped to colors.
+        # Work on a separate intensity grid inferred from colors.
+        intensity_of = {0: 0, 8: 1, 3: 2, 6: 3, 5: 4, 4: 5, 2: 6, 7: 7, 1: 8}
+        color_of = [0, 8, 3, 6, 5, 4, 2, 7, 1]
+        new = [[0 for _ in range(self.w)] for _ in range(self.h)]
+        for y in range(self.h):
+            for x in range(self.w):
+                val = intensity_of.get(self.grid[y][x], 0)
+                # Borrow heat from a random neighbor sometimes.
+                if random.random() < 0.30:
+                    nx = clamp(x + random.choice([-1, 0, 1]), 0, self.w - 1)
+                    ny = clamp(y + random.choice([-1, 0, 1]), 0, self.h - 1)
+                    val = max(val, intensity_of.get(self.grid[ny][nx], 0) - 1)
+                val = max(0, val - (1 if random.random() < 0.35 else 0))
+                new[y][x] = color_of[min(8, val)]
+        for _ in range(max(1, (self.w * self.h) // 180)):
+            x = random.randrange(self.w)
+            y = random.randrange(self.h)
+            new[y][x] = random.choice([1, 2, 4, 5, 7])
+        self.grid = new
+
+    def step_marquee(self) -> None:
+        if not self.marquee_columns:
+            return
+        self.clear(0)
+        y0 = (self.h - 7) // 2
+        for source_x, column in enumerate(self.marquee_columns):
+            screen_x = self.marquee_x + source_x
+            if screen_x < 0:
+                continue
+            if screen_x >= self.w:
+                break
+            for glyph_y, lit in enumerate(column):
+                screen_y = y0 + glyph_y
+                if lit and 0 <= screen_y < self.h:
+                    self.grid[screen_y][screen_x] = self.selected
+        # Eight columns/second at the default 16 FPS: legible rather than frantic.
+        if self.tick % 2 == 0:
+            self.marquee_x -= 1
+        if self.marquee_x + len(self.marquee_columns) < 0:
+            self.marquee_x = self.w
+
+    def render_cell(
+        self,
+        color: int,
+        cursor_here: bool = False,
+        selected_here: bool = False,
+        clarity_color: Optional[int] = None,
+        clarity_boundary: bool = False,
+    ) -> str:
+        # Clarity is a proper semantic lens: when it knows a field, structural
+        # identity outranks the ordinary byte/lens color.  Unknown material keeps
+        # the normal FatPix rendering, so surrounding context is still visible.
+        logical = clarity_color if clarity_color is not None else color
+        c = self.displayed_color(logical)
+        if cursor_here:
+            if self.file_mode:
+                # File cursor must remain visible even when the cell itself is green/white.
+                c = 0 if c == 1 else 1
+            else:
+                # Blink/preview cursor uses the same display mapping as the board and footer.
+                c = self.displayed_color(self.selected if (self.tick // 5) % 2 == 0 else 1)
+        if self.use_ansi_skin:
+            cell = f"\x1b[{ANSI_BG[c]}m  \x1b[0m"
+            if clarity_boundary and clarity_color is not None:
+                cell = f"\x1b[1m{cell}\x1b[0m"
+        else:
+            glyphs = CIRCLE_GLYPHS if clarity_boundary and clarity_color is not None and not cursor_here else GLYPHS
+            cell = glyphs[c]
+        if selected_here:
+            # Reverse-video is a terminal-native, geometry-preserving selection marker.
+            return f"\x1b[7m{cell}\x1b[0m"
+        return cell
+
+    def render(self) -> str:
+        out: List[str] = ["\x1b[H"]
+        if self.show_help:
+            return self.render_help()
+        for y in range(self.h):
+            row_out = []
+            for x in range(self.w):
+                cursor_here = x == self.cursor_x and y == self.cursor_y and (self.mode == "idle" or self.file_mode)
+                info = self.file_cell_info[y][x] if self.file_mode and self.file_cell_info else None
+                selected_here = self.file_mode and self.file_cell_is_selected(info)
+                clarity_color, clarity_boundary = self.clarity_cell_state(x, y) if self.file_mode else (None, False)
+                row_out.append(
+                    self.render_cell(
+                        self.grid[y][x], cursor_here, selected_here,
+                        clarity_color, clarity_boundary,
+                    )
+                )
+            out.append("".join(row_out))
+            out.append("\x1b[K\n")
+        out.append(self.render_status())
+        out.append(self.render_inspector_overlay())
+        out.append(self.render_clarity_legend())
+        return "".join(out)
+
+    def render_help(self) -> str:
+        out = ["\x1b[H\x1b[2J"]
+        width = max(20, self.term_cols)
+        if self.file_mode and self.inspect_open:
+            help_text = INSPECT_HELP_TEXT
+        else:
+            help_text = FILE_HELP_TEXT if self.file_mode else HELP_TEXT
+        for i in range(self.term_rows - 1):
+            line = help_text[i] if i < len(help_text) else ""
+            out.append(fit_line(line, width))
+            out.append("\x1b[K\n")
+        out.append(fit_line("? or Esc: return | q: quit", width))
+        out.append("\x1b[K")
+        return "".join(out)
+
+    def render_status(self) -> str:
+        if self.file_mode:
+            if self.command_open:
+                return (
+                    "\x1b[0m"
+                    + fit_line(f":{self.command}", self.term_cols)
+                    + "\x1b[K\n"
+                    + fit_line("Enter: run command | Esc: cancel", self.term_cols)
+                    + "\x1b[K"
+                )
+
+            info = self.current_file_info()
+            assert self.file_source is not None
+            scale = str(self.file_bytes_per_cell)
+            if info:
+                start = info["start"]
+                end = start + max(0, info["span"])
+                # cursor already names the exact 1-byte address; only spell out
+                # the cell extent when a coarse pixel actually spans a range.
+                locus = "" if info["span"] == 1 else f"cell=0x{start:x}..0x{end:x}"
+                detail = f"{locus} {info.get('lens_detail', '')}".strip()
+            else:
+                detail = "no cell"
+            selection = ""
+            if self.file_selection_start is not None and self.file_selection_end is not None:
+                selection = (
+                    f" sel=0x{self.file_selection_start:x}..0x{self.file_selection_end:x}"
+                    f"({human_size(self.file_selection_end - self.file_selection_start)})"
+                )
+            clarity = ""
+            if self.clarity_enabled:
+                ann = self.clarity_annotation_at(self.file_cursor_addr)
+                if ann is not None:
+                    path = str(ann.get('path', ann.get('label', 'view')))
+                    clarity = f" clarity=\x1b[1m{path}\x1b[22m"
+                elif self.clarity_active:
+                    clarity = " clarity=on"
+                else:
+                    clarity = " clarity=none"
+            line1 = (
+                f"file={self.file_label} cursor=0x{self.file_cursor_addr:x} scale:{scale} "
+                f"size={human_size(self.file_source.size)}"
+                f"{clarity} {detail}{selection}"
+            )
+            line2 = "? for help" + (f" | {self.message}" if self.message else "")
+            return (
+                "\x1b[0m"
+                + fit_line(line1, self.term_cols)
+                + "\x1b[K\n"
+                + fit_line(line2, self.term_cols)
+                + "\x1b[K"
+            )
+
+        palette = " ".join(
+            f"{i + 1}{GLYPHS[self.displayed_color(i)]}" for i in range(len(GLYPHS))
+        )
+        line2 = f"{palette} | ?:help :command q:quit"
+        anim = "on" if self.animate else "paused"
+        if self.command_open:
+            line1 = f":{self.command}"
+        else:
+            line1 = (
+                f"mode={self.mode} anim={anim} fps={self.fps:.0f} size={self.w}x{self.h} "
+                f"cursor={self.cursor_x},{self.cursor_y} color={self.color_label(self.selected)} | {self.message}"
+            )
+        # Reserve exactly two terminal rows; erase any remnants from longer prior lines.
+        return (
+            "\x1b[0m"
+            + fit_line(line1, self.term_cols)
+            + "\x1b[K\n"
+            + fit_line(line2, self.term_cols)
+            + "\x1b[K"
+        )
+
+    def handle_key(self, key) -> bool:
+        if isinstance(key, tuple) and key and key[0] == "MOUSE":
+            # Help/command overlays intentionally ignore application mouse gestures.
+            if not self.show_help and not self.command_open:
+                self.handle_mouse(key)
+            return True
+        # Return False to quit. Help deliberately outranks every interactive mode:
+        # '?' must remain discoverable even inside the inspector or command line.
+        if self.show_help:
+            if key in ("q", "QUIT"):
+                return False
+            if key in ("?", "ESC"):
+                self.close_help()
+            return True
+        if key == "?":
+            self.open_help()
+            return True
+        if self.command_open:
+            return self.handle_command_key(key)
+        if key in ("q", "QUIT"):
+            return False
+        if self.file_mode:
+            if key == ":":
+                self.command_open = True
+                self.command = ""
+            elif key == "i":
+                self.toggle_inspector()
+            elif key == "C":
+                if self.clarity_enabled:
+                    self.clear_clarity_overlay()
+                else:
+                    self.run_clarity_overlay()
+            elif key == "c":
+                self.toggle_clarity_legend()
+            elif key == "ESC" and self.inspect_open:
+                self.toggle_inspector()
+            elif key == "ESC" and self.file_selection_start is not None:
+                self.clear_file_selection()
+            elif self.inspect_open and key in (",", "<"):
+                self.change_inspector_page(-1)
+            elif self.inspect_open and key in (".", ">"):
+                self.change_inspector_page(1)
+            elif key == "PGUP":
+                self.jump_file_cursor_half_page(-1)
+            elif key == "PGDN":
+                self.jump_file_cursor_half_page(1)
+            elif key in ("UP", "w", "k"):
+                self.move_file_cursor(0, -1)
+            elif key in ("DOWN", "s", "j"):
+                self.move_file_cursor(0, 1)
+            elif key in ("LEFT", "a", "h"):
+                self.move_file_cursor(-1, 0)
+            elif key in ("RIGHT", "d", "l"):
+                self.move_file_cursor(1, 0)
+            elif key in ("=", "+", "\r", "\n"):
+                self.zoom_file(True)
+            elif key in ("-", "_"):
+                self.zoom_file(False)
+            elif key == "g":
+                self.command_open = True
+                self.command = "goto "
+            elif key in "123456":
+                self.set_file_lens(int(key))
+            return True
+        if key == ":":
+            self.command_open = True
+            self.command = ""
+        elif key in ("UP", "k"):
+            self.cursor_y = clamp(self.cursor_y - 1, 0, self.h - 1)
+            self.mode = "idle"
+        elif key in ("DOWN", "j"):
+            self.cursor_y = clamp(self.cursor_y + 1, 0, self.h - 1)
+            self.mode = "idle"
+        elif key in ("LEFT", "h"):
+            self.cursor_x = clamp(self.cursor_x - 1, 0, self.w - 1)
+            self.mode = "idle"
+        elif key in ("RIGHT", "l"):
+            self.cursor_x = clamp(self.cursor_x + 1, 0, self.w - 1)
+            self.mode = "idle"
+        elif key in (" ", "\r", "\n"):
+            self.mode = "idle"
+            self.paint(self.cursor_x, self.cursor_y, self.selected)
+        elif key == "x":
+            self.mode = "idle"
+            self.paint(self.cursor_x, self.cursor_y, 0)
+        elif key in "123456789":
+            self.selected = int(key) - 1
+            self.message = f"selected {self.color_label(self.selected)}"
+        elif key == "c":
+            self.clear(0)
+            self.mode = "idle"
+            self.message = "cleared black"
+        elif key == "f":
+            self.fill(self.selected)
+            self.mode = "idle"
+            self.message = f"filled {NAMES[self.selected]}"
+        elif key == "n":
+            self.noise(1.0)
+            self.mode = "idle"
+            self.message = "noise burst"
+        elif key == "w":
+            self.mode = "wave"; self.animate = True; self.message = "wave mode"
+        elif key == "d":
+            self.mode = "drip"; self.animate = True; self.message = "drip mode"
+        elif key == "r":
+            self.mode = "rain"; self.animate = True; self.message = "rain mode"
+        elif key == "s":
+            self.mode = "spark"; self.animate = True; self.message = "spark mode"
+        elif key == "m":
+            if self.marquee_columns:
+                self.mode = "marquee"; self.animate = True; self.message = "marquee mode"
+            else:
+                self.message = "no marquee text; use :text <message>"
+        elif key == "i":
+            self.mode = "idle"; self.message = "idle/paint mode"
+        elif key == "a":
+            self.animate = not self.animate
+            self.message = "animation " + ("on" if self.animate else "paused")
+        elif key == "[":
+            self.fps = max(1.0, self.fps - 2.0)
+            self.message = f"fps {self.fps:.0f}"
+        elif key == "]":
+            self.fps = min(60.0, self.fps + 2.0)
+            self.message = f"fps {self.fps:.0f}"
+        elif key == "g":
+            self.use_ansi_skin = not self.use_ansi_skin
+            self.message = "ansi skin" if self.use_ansi_skin else "unicode square skin"
+        elif key == "R":
+            self.palette_offset = (self.palette_offset + 1) % 6
+            suffix = " (Unicode skin only)" if self.use_ansi_skin else ""
+            self.message = f"palette offset {self.palette_offset}{suffix}"
+        return True
+
+    def handle_command_key(self, key: str) -> bool:
+        if key in ("QUIT",):
+            return False
+        if key == "ESC":
+            self.command_open = False
+            self.message = "command canceled"
+            return True
+        if key in ("\r", "\n"):
+            cmd = self.command.strip()
+            self.command_open = False
+            self.run_command(cmd)
+            return True
+        if key in ("\x7f", "\b"):
+            self.command = self.command[:-1]
+            return True
+        if len(key) == 1 and key >= " ":
+            self.command += key
+        return True
+
+    def run_command(self, cmd: str) -> None:
+        if not cmd:
+            self.message = "empty command"
+            return
+        parts = cmd.split()
+        op = parts[0].lower()
+        args = parts[1:]
+        try:
+            if self.file_mode and op == "goto":
+                if not args:
+                    raise ValueError("goto needs an offset")
+                self.goto_file_offset(parse_offset(args[0]))
+            elif self.file_mode and op == "scale":
+                if not args:
+                    raise ValueError("scale needs bytes/cell")
+                self.set_file_scale(parse_offset(args[0]))
+            elif self.file_mode and op == "view":
+                if not args:
+                    raise ValueError("view needs 1-6 or a view name")
+                token = args[0].lower()
+                if token.isdigit():
+                    lens = int(token)
+                else:
+                    matches = [n for n, name in FILE_LENSES.items() if name == token or name.startswith(token)]
+                    if len(matches) != 1:
+                        raise ValueError("unknown or ambiguous view")
+                    lens = matches[0]
+                self.set_file_lens(lens)
+            elif self.file_mode and op == "dump":
+                filename = cmd.partition(" ")[2].strip()
+                if not filename:
+                    raise ValueError("dump needs a filename")
+                self.dump_file_selection(filename)
+            elif self.file_mode and op == "clarity":
+                if args and args[0].lower() == "off":
+                    self.clear_clarity_overlay()
+                elif args and args[0].lower() == "map":
+                    self.toggle_clarity_legend()
+                elif args and args[0].lower() not in ("on", "refresh"):
+                    raise ValueError("clarity accepts on, off, refresh, or map")
+                else:
+                    self.run_clarity_overlay()
+            elif op == "clear":
+                color = parse_color(args[0], 0) if args else 0
+                if color is None:
+                    raise ValueError("unknown color")
+                self.clear(color)
+                self.mode = "idle"
+                self.message = f"cleared {NAMES[color]}"
+            elif op == "fill":
+                if not args:
+                    raise ValueError("fill needs a color")
+                color = parse_color(args[0])
+                if color is None:
+                    raise ValueError("unknown color")
+                self.fill(color)
+                self.mode = "idle"
+                self.message = f"filled {NAMES[color]}"
+            elif op == "noise":
+                density = 1.0
+                colors: List[int] = []
+                if args:
+                    try:
+                        density = float(args[0])
+                        rest = args[1:]
+                    except ValueError:
+                        rest = args
+                    for a in rest:
+                        color = parse_color(a)
+                        if color is not None:
+                            colors.append(color)
+                self.noise(density, colors or None)
+                self.mode = "idle"
+                self.message = f"noise density {density:.2f}"
+            elif op == "mode":
+                modes = ("idle", "wave", "drip", "rain", "spark", "marquee")
+                if not args or args[0] not in modes:
+                    raise ValueError("mode needs idle|wave|drip|rain|spark|marquee")
+                if args[0] == "marquee" and not self.marquee_columns:
+                    raise ValueError("marquee has no text; use text <message>")
+                self.mode = args[0]
+                self.animate = self.mode != "idle"
+                self.message = f"mode {self.mode}"
+            elif op == "speed":
+                if not args:
+                    raise ValueError("speed needs fps")
+                self.fps = max(1.0, min(60.0, float(args[0])))
+                self.message = f"fps {self.fps:.0f}"
+            elif op == "text":
+                message = cmd.partition(" ")[2]
+                self.set_marquee_text(message)
+            elif op == "save":
+                if not args:
+                    raise ValueError("save needs filename")
+                self.save(args[0])
+            elif op == "load":
+                if not args:
+                    raise ValueError("load needs filename")
+                self.load(args[0])
+            else:
+                self.message = f"unknown command: {op}"
+        except Exception as e:  # broad, because command UX should not crash the toy
+            self.message = f"command error: {e}"
+
+    def save(self, filename: str) -> None:
+        with open(filename, "w", encoding="utf-8") as f:
+            for row in self.grid:
+                f.write("".join(GLYPHS[c] for c in row) + "\n")
+        self.message = f"saved {filename}"
+
+    def load(self, filename: str) -> None:
+        with open(filename, "r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f]
+        new = [[0 for _ in range(self.w)] for _ in range(self.h)]
+        for y, line in enumerate(lines[: self.h]):
+            x = 0
+            for ch in line:
+                if x >= self.w:
+                    break
+                if ch in GLYPH_TO_IDX:
+                    new[y][x] = GLYPH_TO_IDX[ch]
+                    x += 1
+        self.grid = new
+        self.mode = "idle"
+        self.message = f"loaded {filename}"
+
+
+def resolve_clarity_path(explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+
+    candidates = [
+        os.path.join(os.getcwd(), "clarity.py"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "clarity.py"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Unicode fat-pixel terminal wall and stdin marquee."
+    )
+    parser.add_argument(
+        "--no-marquee",
+        action="store_true",
+        help="ignore piped stdin and launch the normal animation wall",
+    )
+    parser.add_argument(
+        "--file",
+        metavar="PATH",
+        help="visualize bytes from PATH; use - to read bytes from stdin",
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help="redact PR:[source path] from the file-view status line",
+    )
+    parser.add_argument(
+        "--clarity",
+        metavar="PATH",
+        help="optional clarity.py used by the C semantic-view key; auto-detects ./clarity.py or a sibling",
+    )
+    args = parser.parse_args(argv)
+    if args.clarity:
+        path = os.path.abspath(os.path.expanduser(args.clarity))
+        if not os.path.isfile(path):
+            parser.error(f"--clarity script not found: PR:[{path}]")
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    clarity_path = resolve_clarity_path(args.clarity)
+    piped_input = not sys.stdin.isatty()
+    keyboard_fd = sys.stdin.fileno() if not piped_input else -1
+    owned_keyboard_fd: Optional[int] = None
+    marquee_text: Optional[str] = None
+    source: Optional[ByteSource] = None
+    file_label = ""
+
+    try:
+        if args.file is not None:
+            if args.file == "-":
+                if not piped_input:
+                    raise RuntimeError("--file - needs bytes piped on stdin")
+                source = ByteSource(data=sys.stdin.buffer.read())
+                file_label = "stdin"
+            else:
+                source = ByteSource(path=args.file)
+                file_label = args.file
+
+            if piped_input:
+                try:
+                    keyboard_fd = os.open("/dev/tty", os.O_RDWR)
+                    owned_keyboard_fd = keyboard_fd
+                except OSError as e:
+                    raise RuntimeError(f"file view with piped stdin needs /dev/tty for keys: {e}") from e
+        elif piped_input:
+            try:
+                keyboard_fd = os.open("/dev/tty", os.O_RDWR)
+                owned_keyboard_fd = keyboard_fd
+            except OSError as e:
+                raise RuntimeError(f"piped input needs a controlling /dev/tty for keys: {e}") from e
+
+            if args.no_marquee:
+                # Do not leave a producer blocked on a pipe nobody intends to consume.
+                sys.stdin.close()
+            else:
+                incoming = sys.stdin.read()
+                if incoming.strip():
+                    marquee_text = incoming
+
+        app = FatPix(
+            marquee_text,
+            file_source=source,
+            file_label=file_label,
+            private=args.private,
+            clarity_path=clarity_path,
+        )
+        with RawTerminal(keyboard_fd, mouse=app.file_mode) as term:
+            last = 0.0
+            dirty = True
+            while True:
+                cols, rows = term.size()
+                if term.force_resize or cols != app.term_cols or rows != app.term_rows:
+                    term.force_resize = False
+                    app.resize_to_terminal(cols, rows)
+                    sys.stdout.write("\x1b[2J")
+                    dirty = True
+
+                key = term.read_key()
+                if key is not None:
+                    if not app.handle_key(key):
+                        break
+                    dirty = True
+
+                now = time.monotonic()
+                if app.animate:
+                    frame_delay = 1.0 / max(1.0, app.fps)
+                    if now - last >= frame_delay:
+                        app.step()
+                        dirty = True
+                        last = now
+
+                if app.file_dirty:
+                    app.refresh_file_grid()
+                    dirty = True
+
+                if dirty:
+                    sys.stdout.write(app.render())
+                    sys.stdout.flush()
+                    dirty = False
+                else:
+                    # Static file/inspector views are event-driven.  Do not redraw
+                    # an unchanged screen 16 times a second just because FatPix's
+                    # animation engine happens to have a default FPS.
+                    time.sleep(0.005)
+    finally:
+        if source is not None:
+            source.close()
+        if owned_keyboard_fd is not None:
+            os.close(owned_keyboard_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(0)
