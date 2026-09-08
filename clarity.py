@@ -417,7 +417,10 @@ def _split_mapping_pair(text: str) -> tuple[str, str]:
             depth += 1
         elif ch in "])}":
             depth -= 1
-        elif ch == ":" and depth == 0:
+        # In a YAML plain scalar, ':' is only a mapping separator when it is
+        # followed by whitespace (or ends the scalar).  Kaitai enum references
+        # such as ``color_type::indexed`` are legitimate mapping keys.
+        elif ch == ":" and depth == 0 and (i + 1 == len(text) or text[i + 1].isspace()):
             return text[:i].strip(), text[i + 1:].strip()
     raise KsyError(f"expected mapping pair: {text!r}")
 
@@ -500,8 +503,12 @@ def parse_ksy_yaml(text: str) -> dict:
                     item, i = parse_block(i, lines[i][0])
                     out.append(item)
                     continue
-                if ":" in body and body[:1] not in {"'", '"'}:
-                    key, value = _split_mapping_pair(body)
+                try:
+                    pair = _split_mapping_pair(body) if body[:1] not in {"'", '"'} else None
+                except KsyError:
+                    pair = None
+                if pair is not None:
+                    key, value = pair
                     item: dict = {key: _yaml_scalar(value) if value else None}
                     if not value and i < len(lines) and lines[i][0] > indent:
                         child_indent = lines[i][0]
@@ -1483,7 +1490,7 @@ def parse_ksy_structure(
             # root stream. Parse them only when an expression actually refers to
             # them; eagerly walking directory extents can recurse through `.`
             # indefinitely and invents views no caller requested.
-            if scope.parent is not None:
+            if scope.parent is not None and spec.get("io") is not None:
                 continue
             try:
                 process_one_instance(str(instance_id), spec, scope, depth, cursor)
@@ -1884,18 +1891,33 @@ def parse_ksy_structure(
             child_end_limit = limit_end if size is None else cursor + size
             if child_end_limit > limit_end:
                 raise KsyError(f"bounded type {path} exceeds parent stream")
-            child_end, child_scope = parse_type(
-                nested,
-                cursor,
-                path,
-                depth + 1,
-                scope,
-                cursor if size is not None else scope.stream_start,
-                child_end_limit if size is not None else scope.stream_end,
-                "subfield",
-                param_values=type_args,
-                source_doc=nested_doc,
-            )
+            try:
+                child_end, child_scope = parse_type(
+                    nested,
+                    cursor,
+                    path,
+                    depth + 1,
+                    scope,
+                    cursor if size is not None else scope.stream_start,
+                    child_end_limit if size is not None else scope.stream_end,
+                    "subfield",
+                    param_values=type_args,
+                    source_doc=nested_doc,
+                )
+            except (KsyError, KsyUnsupported) as exc:
+                # A sized substream has proven outer geometry even when its
+                # selected inner interpretation asks for bytes the substream
+                # does not contain (ZIP central-directory timestamps exercise
+                # this). Preserve the decoded prefix, explicitly own the rest
+                # as opaque bytes of this field, and resume after the boundary.
+                if not partial or size is None:
+                    raise
+                issues.append(f"{path}: {exc}")
+                ann(cursor, child_end_limit, path, label, depth, semantic_kind,
+                    type=nested_type_name, opaque_remainder=True, **size_evidence(field))
+                value = data[cursor:child_end_limit]
+                values[path] = value
+                return value, child_end_limit
             visible_end = child_end_limit if size is not None else child_end
             ann(cursor, visible_end, path, label, depth, semantic_kind, type=nested_type_name)
             child_value = _KsyStruct(
@@ -2402,6 +2424,37 @@ def auto_ksy_views(
                         "depth": 0,
                         "kind": "container",
                     }] + body
+
+                # Some address-space KSYs decode the first allocation unit and
+                # expose both unit size and unit count as scalar header values,
+                # without spelling out a redundant byte array for the remaining
+                # units. SQLite's real definition is the motivating construct.
+                # When those independently parsed values account exactly for the
+                # supplied root stream, retain the undecoded units explicitly as
+                # opaque structure rather than leaving a false ownership hole.
+                parsed_extent = int(parsed.get("extent", 0))
+                scalar_ints = {
+                    value for value in parsed.get("values", {}).values()
+                    if isinstance(value, int) and not isinstance(value, bool) and value > 0
+                }
+                stream_extent = len(data) - root_local
+                if (
+                    root_local == 0
+                    and parsed_extent >= 512
+                    and parsed_extent < stream_extent
+                    and parsed_extent in scalar_ints
+                    and stream_extent % parsed_extent == 0
+                    and stream_extent // parsed_extent in scalar_ints
+                ):
+                    annotations.append({
+                        "start": base_offset + parsed_extent,
+                        "end": base_offset + stream_extent,
+                        "path": f"{ksy_id}.opaque_allocation_units",
+                        "label": "opaque allocation units",
+                        "depth": 1,
+                        "kind": "payload",
+                        "size_rule": "parsed unit size * parsed unit count",
+                    })
                 if len(annotations) < 2:
                     continue
 
@@ -2954,6 +3007,24 @@ def analysis_result(
 
     views = mbr_views(data, base_offset, windowed=windowed)
     views.extend(auto_ksy_views(data, base_offset, max(0, MAX_AUTO_KSY_VIEWS - len(views))))
+    # A contradicted candidate remains useful when it is the only hypothesis,
+    # but must not paint over a corroborated interpretation of the same root.
+    # RIFF/WAVE versus AVI is the concrete corpus case: both share RIFF, while
+    # AVI's required second literal directly contradicts the WAVE form type.
+    strong_roots = {
+        int(view["offset"])
+        for view in views
+        if view.get("kind") == "ksy_structure" and view.get("strong_identity")
+    }
+    views = [
+        view for view in views
+        if not (
+            view.get("kind") == "ksy_structure"
+            and not view.get("strong_identity")
+            and view.get("hard_contradictions")
+            and int(view.get("offset", -1)) in strong_roots
+        )
+    ]
     identity = [
         claim
         for view in views

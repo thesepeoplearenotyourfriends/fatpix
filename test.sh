@@ -1070,32 +1070,20 @@ check_real_projection test/george2.jpg jpeg
 check_real_projection test/george.gz gzip
 check_real_projection test/george.tar.gz gzip
 
-projection_failures=0
-for specimen_and_format in \
-    "test/sample.png png" \
-    "test/george.zip zip" \
-    "test/sample.sqlite sqlite3"
-do
-    set -- $specimen_and_format
-    if ! check_real_projection "$1" "$2"; then
-        projection_failures=$((projection_failures + 1))
-    fi
-done
+check_real_projection test/sample.png png
+check_real_projection test/george.zip zip
+check_real_projection test/sample.sqlite sqlite3
+check_real_projection test/sample.wav wav
 
-# WAV owns the whole file in the whole-file result, but is not a projection pass:
-# an equally broad AVI hypothesis overlaps it and can win FatPix field painting.
+# The shared RIFF anchor may nominate AVI, but its contradicted form-type
+# literal must not survive beside the strongly corroborated WAV root.
 ./clarity.py --analyze --json test/sample.wav > "$tmp/wav-projection-audit.json"
 python3 - "$tmp/wav-projection-audit.json" <<'PY'
-import json, os, sys
+import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-size = os.path.getsize("test/sample.wav")
-wav = [v for v in obj["views"] if v.get("ksy_id") == "wav"]
 avi = [v for v in obj["views"] if v.get("ksy_id") == "avi"]
-if not any(v["offset"] == 0 and v["extent"] == size and v.get("strong_identity") for v in wav):
-    raise SystemExit("FAIL: WAV audit lost its whole-file primary view")
-if not any(v["offset"] == 0 and v["extent"] == size for v in avi):
-    raise SystemExit("FAIL: WAV audit no longer reproduces the competing AVI view")
-print(f"projection known-ambiguous: test/sample.wav size={size} wav=0:{size} competing_avi=0:{size}")
+if avi:
+    raise SystemExit(f"FAIL: contradicted AVI view still overlaps known WAV: {avi}")
 PY
 
 # The real FAT and ext2 definitions currently prove useful structure before
@@ -1276,10 +1264,5 @@ obj = json.load(open(sys.argv[1], encoding="utf-8"))
 require(not any((v.get('strong_identity') for v in obj.get('views', []))), "assertion failed: not any((v.get('strong_identity') for v in obj.get('views', [])))")
 PY
 done
-
-if [ "$projection_failures" -ne 0 ]; then
-    echo "FAIL: $projection_failures known whole-file projection acceptance check(s) remain incomplete" >&2
-    exit 1
-fi
 
 echo "PASS: mechanics + metrology + stats/analyze/JSON contracts + 1800-case truth universe + real KSY acceptance"

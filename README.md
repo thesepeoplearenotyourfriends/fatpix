@@ -8,6 +8,8 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Completed whole-file projection for the real PNG, ZIP, SQLite, and WAV
+  specimens and suppressed contradicted same-root views beside strong identity.
 - Separated real-file identity checks from structural-coverage checks, recording
   known PNG, ZIP, and SQLite gaps, WAV/AVI overlap, and full JPEG/gzip maps.
 - Bounded queued navigation repeats and made terminal quit input preempt stale

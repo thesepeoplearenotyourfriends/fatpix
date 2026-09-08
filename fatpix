@@ -1163,12 +1163,17 @@ class FatPix:
             )
             return
 
-        # Give structure detectors enough context not to mistake the viewport edge
-        # for a real boundary, without turning a small interactive query into a
-        # whole-device scan.
-        halo = min(CLARITY_MAX_HALO_BYTES, max(512, visible_span // 2))
-        analysis_start = max(0, visible_start - halo)
-        analysis_end = min(self.file_source.size, visible_start + visible_span + halo)
+        # Small files fit inside the existing bounded context budget, so retain
+        # their complete root object at every viewport. This prevents a format
+        # map proven at byte zero from disappearing merely because the user
+        # navigated into its payload. Large devices still use a local halo.
+        if self.file_source.size <= CLARITY_MAX_HALO_BYTES:
+            analysis_start = 0
+            analysis_end = self.file_source.size
+        else:
+            halo = min(CLARITY_MAX_HALO_BYTES, max(512, visible_span // 2))
+            analysis_start = max(0, visible_start - halo)
+            analysis_end = min(self.file_source.size, visible_start + visible_span + halo)
         payload = self.file_source.read(analysis_start, analysis_end - analysis_start)
         if not payload:
             self.message = "Clarity: analysis read returned no bytes"
