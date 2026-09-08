@@ -467,6 +467,11 @@ class RawTerminal:
         (b"\x1b[5~", "PGUP"),
         (b"\x1b[6~", "PGDN"),
     )
+    _NAVIGATION_EVENTS = frozenset({
+        "UP", "DOWN", "LEFT", "RIGHT", "PGUP", "PGDN",
+        "w", "a", "s", "d", "h", "j", "k", "l",
+    })
+    _MAX_QUEUED_NAVIGATION = 5
 
     def __init__(self, input_fd: int, mouse: bool = False) -> None:
         self.stdin_fd = input_fd
@@ -508,11 +513,33 @@ class RawTerminal:
         s = shutil.get_terminal_size(fallback=(80, 24))
         return s.columns, s.lines
 
+    def _queue_event(self, event) -> None:
+        """Queue input without allowing key-repeat navigation to run away.
+
+        Commands, text, and mouse input remain lossless.  Only stale movement
+        repeats are bounded, and QUIT overtakes/discards those repeats so an
+        overloaded renderer can always be interrupted promptly.
+        """
+        if event == "QUIT":
+            self._events = deque(
+                queued for queued in self._events
+                if queued not in self._NAVIGATION_EVENTS
+            )
+            self._events.appendleft(event)
+            return
+        if event in self._NAVIGATION_EVENTS:
+            queued_navigation = sum(
+                queued in self._NAVIGATION_EVENTS for queued in self._events
+            )
+            if queued_navigation >= self._MAX_QUEUED_NAVIGATION:
+                return
+        self._events.append(event)
+
     def _parse_input(self) -> None:
         while self._input:
             if self._input[0] in (3, 4):
                 del self._input[:1]
-                self._events.append("QUIT")
+                self._queue_event("QUIT")
                 continue
 
             if self._input[0] == 0x1B:
@@ -521,7 +548,7 @@ class RawTerminal:
                     code, x, y, final = mouse.groups()
                     consumed = mouse.end()
                     del self._input[:consumed]
-                    self._events.append((
+                    self._queue_event((
                         "MOUSE",
                         int(code),
                         int(x),
@@ -534,7 +561,7 @@ class RawTerminal:
                 for seq, name in self._KEY_SEQS:
                     if self._input.startswith(seq):
                         del self._input[:len(seq)]
-                        self._events.append(name)
+                        self._queue_event(name)
                         matched = True
                         break
                 if matched:
@@ -555,13 +582,13 @@ class RawTerminal:
                 ):
                     return
                 del self._input[:1]
-                self._events.append("ESC")
+                self._queue_event("ESC")
                 continue
 
             first = self._input[0]
             if first < 0x80:
                 del self._input[:1]
-                self._events.append(chr(first))
+                self._queue_event(chr(first))
                 continue
 
             # FatPix commands are ASCII, but don't corrupt a pasted UTF-8 char.
@@ -573,7 +600,7 @@ class RawTerminal:
                 except UnicodeDecodeError:
                     continue
                 del self._input[:length]
-                self._events.append(ch)
+                self._queue_event(ch)
                 break
             else:
                 del self._input[:1]

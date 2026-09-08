@@ -152,6 +152,51 @@ check("nontext structural character", clarity.structural_character(bytes(range(3
 print(f"Clarity metrology: {len(checks)}/{len(checks)} exact checks")
 PY
 
+# Bound only movement repeats at the raw terminal queue boundary.
+python3 - <<'PY'
+import importlib.machinery
+import importlib.util
+
+loader = importlib.machinery.SourceFileLoader("fatpix_test", "fatpix")
+spec = importlib.util.spec_from_loader(loader.name, loader)
+fatpix = importlib.util.module_from_spec(spec)
+loader.exec_module(fatpix)
+
+def terminal():
+    return fatpix.RawTerminal(-1)
+
+t = terminal()
+t._input.extend(b"\x1b[6~" * 500)
+t._parse_input()
+assert list(t._events) == ["PGDN"] * t._MAX_QUEUED_NAVIGATION
+
+# Non-navigation input remains lossless behind a saturated movement queue.
+t._input.extend(b"x")
+t._parse_input()
+assert list(t._events)[-1] == "x"
+
+# Ctrl-C preempts and discards only navigation; the unrelated event survives.
+t._input.extend(b"\x03")
+t._parse_input()
+assert t.read_key() == "QUIT"
+assert list(t._events) == ["x"]
+
+# Ordinary encoded movements retain their established event names.  Drain each
+# event to show that repeated reads continue to navigate normally.
+for raw, expected in (
+    (b"\x1b[A", "UP"), (b"\x1b[B", "DOWN"),
+    (b"\x1b[C", "RIGHT"), (b"\x1b[D", "LEFT"),
+    (b"\x1b[5~", "PGUP"), (b"\x1b[6~", "PGDN"),
+    (b"w", "w"), (b"a", "a"), (b"s", "s"), (b"d", "d"),
+):
+    t = terminal()
+    t._input.extend(raw)
+    t._parse_input()
+    assert t.read_key() == expected
+
+print("RawTerminal navigation queue: bounded repeats, lossless commands, preemptive quit")
+PY
+
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
 python3 clarity.py --stats "$tmp/probe-xor.grb" > "$tmp/explicit-stats.txt"
@@ -867,7 +912,7 @@ if precision < 0.99 or recall < 0.95 or partial_wrong:
 PY
 
 # --- Real Kaitai acceptance: public anonymous-file path, never generated KSY. ---
-check_real_ksy() {
+check_real_identity() {
     specimen=$1
     expected=$2
     ./clarity.py --analyze --json "$specimen" > "$tmp/real-ksy.json"
@@ -887,24 +932,100 @@ for view in matches:
 PY
 }
 
-check_real_ksy test/gpt.img gpt_partition_table
-check_real_ksy test/sample.png png
-check_real_ksy test/x86_64.elf elf
-check_real_ksy test/george.zip zip
-check_real_ksy test/george.gz gzip
-check_real_ksy test/george.tar.gz gzip
-check_real_ksy test/sample.iso iso9660
-check_real_ksy test/sample.sqlite sqlite3
-check_real_ksy test/sample.avi avi
-check_real_ksy test/sample.mp3 id3v2_3
+check_real_identity test/gpt.img gpt_partition_table
+check_real_identity test/sample.png png
+check_real_identity test/x86_64.elf elf
+check_real_identity test/george.zip zip
+check_real_identity test/george.gz gzip
+check_real_identity test/george.tar.gz gzip
+check_real_identity test/sample.iso iso9660
+check_real_identity test/sample.sqlite sqlite3
+check_real_identity test/sample.avi avi
+check_real_identity test/sample.mp3 id3v2_3
 # This specimen's suffix is misleading; its bytes are an ordinary gzip stream.
-check_real_ksy test/george.jpg gzip
-check_real_ksy test/george2.jpg jpeg
-check_real_ksy test/sample.wav wav
-check_real_ksy test/fat.img vfat
-check_real_ksy test/ext2.img ext2
+check_real_identity test/george.jpg gzip
+check_real_identity test/george2.jpg jpeg
+check_real_identity test/sample.wav wav
+check_real_identity test/fat.img vfat
+check_real_identity test/ext2.img ext2
 [ -f test/cmd.exe ] || { echo "FAIL: missing acceptance specimen test/cmd.exe" >&2; exit 1; }
-check_real_ksy test/cmd.exe microsoft_pe
+check_real_identity test/cmd.exe microsoft_pe
+
+# Identity and byte-map acceptance are deliberately separate.  A known whole
+# file is fully projected only when annotations owned by its primary format
+# cover byte 0 through EOF.  JPEG and gzip are positive controls.  PNG, ZIP,
+# and SQLite record their presently known uncovered tails rather than being
+# mislabeled as projection passes.  ISO9660 has device/filesystem geometry and
+# is intentionally outside this whole-file rule for now.
+check_real_projection() {
+    specimen=$1
+    expected=$2
+    expected_holes=$3
+    ./clarity.py --analyze --json "$specimen" > "$tmp/real-projection.json"
+    python3 - "$tmp/real-projection.json" "$specimen" "$expected" "$expected_holes" <<'PY'
+import json, os, sys
+
+result_path, specimen, expected, encoded_holes = sys.argv[1:]
+obj = json.load(open(result_path, encoding="utf-8"))
+size = os.path.getsize(specimen)
+views = [v for v in obj.get("views", []) if v.get("ksy_id") == expected]
+intervals = sorted(
+    (max(0, int(a["start"])), min(size, int(a["end"])))
+    for view in views
+    for a in view.get("annotations", [])
+    if int(a.get("end", 0)) > int(a.get("start", 0))
+)
+covered = []
+for start, end in intervals:
+    if end <= start:
+        continue
+    if covered and start <= covered[-1][1]:
+        covered[-1][1] = max(covered[-1][1], end)
+    else:
+        covered.append([start, end])
+holes = []
+cursor = 0
+for start, end in covered:
+    if start > cursor:
+        holes.append([cursor, start])
+    cursor = max(cursor, end)
+if cursor < size:
+    holes.append([cursor, size])
+expected_holes = [] if encoded_holes == "none" else [
+    [int(start), int(end)]
+    for item in encoded_holes.split(",")
+    for start, end in [item.split(":")]
+]
+assert holes == expected_holes, (
+    f"{specimen} {expected} projection changed: size={size}, "
+    f"views={[(v.get('offset'), v.get('extent'), v.get('partial'), v.get('issues')) for v in views]}, "
+    f"covered={covered}, holes={holes}"
+)
+state = "full" if not holes else "known-incomplete"
+print(f"projection {state}: {specimen} {expected} size={size} covered={covered} holes={holes}")
+PY
+}
+
+check_real_projection test/george2.jpg jpeg none
+check_real_projection test/george.gz gzip none
+check_real_projection test/george.tar.gz gzip none
+check_real_projection test/sample.png png 54:131308
+check_real_projection test/george.zip zip 10116:10153
+check_real_projection test/sample.sqlite sqlite3 112:12288
+
+# WAV owns the whole file in the whole-file result, but is not a projection pass:
+# an equally broad AVI hypothesis overlaps it and can win FatPix field painting.
+./clarity.py --analyze --json test/sample.wav > "$tmp/wav-projection-audit.json"
+python3 - "$tmp/wav-projection-audit.json" <<'PY'
+import json, os, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+size = os.path.getsize("test/sample.wav")
+wav = [v for v in obj["views"] if v.get("ksy_id") == "wav"]
+avi = [v for v in obj["views"] if v.get("ksy_id") == "avi"]
+assert any(v["offset"] == 0 and v["extent"] == size and v.get("strong_identity") for v in wav)
+assert any(v["offset"] == 0 and v["extent"] == size for v in avi)
+print(f"projection known-ambiguous: test/sample.wav size={size} wav=0:{size} competing_avi=0:{size}")
+PY
 
 # The real FAT and ext2 definitions currently prove useful structure before
 # reaching an out-of-line extent / malformed directory tail in these images.
@@ -975,12 +1096,75 @@ assert all(not v.get("strong_identity") for v in pngs)
 assert not any(v.get("ksy_id") == "zip" for v in obj["views"])
 PY
 
-# Real MBR follows its dedicated structural-coherence path backed by the real KSY.
+# Real MBR acceptance must follow the same public paths as a user.  Keep both
+# renderers here: checking a helper (or JSON alone) can conceal a broken text
+# command, and checking Clarity alone says nothing about FatPix's C-key bridge.
+./clarity.py --analyze test/mbr.img > "$tmp/real-mbr.txt"
+grep -F "View: MBR-shaped sector at 0x0 (strong fit)" "$tmp/real-mbr.txt" >/dev/null
+grep -F "CLAIM: structurally consistent MBR partition table" "$tmp/real-mbr.txt" >/dev/null
+
 ./clarity.py --analyze --json test/mbr.img > "$tmp/real-mbr.json"
 python3 - "$tmp/real-mbr.json" <<'PY'
 import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 assert any(c.get("kind") == "mbr_partition_table" for c in obj.get("claims", []))
+views = [v for v in obj.get("views", []) if v.get("kind") == "mbr_partition_table"]
+assert any(v.get("offset") == 0 and v.get("strong_identity") for v in views)
+assert any(
+    a.get("path") == "mbr.boot_signature"
+    for v in views if v.get("offset") == 0
+    for a in v.get("annotations", [])
+)
+PY
+
+# Drive the real terminal application through a pseudo-terminal: launch the
+# public command, press C, open the semantic legend with c, and verify that the
+# retained overlay contains fields supplied by Clarity's MBR view.
+python3 - "$tmp/fatpix-mbr.tty" <<'PY'
+import os, pty, select, subprocess, sys, time
+
+capture = sys.argv[1]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    ["./fatpix", "--file", "test/mbr.img"],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    env={**os.environ, "TERM": "xterm-256color"},
+    close_fds=True,
+)
+os.close(slave)
+output = bytearray()
+
+def drain_until(needle, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                output.extend(os.read(master, 65536))
+            except OSError:
+                break
+        if needle in output:
+            return True
+    return needle in output
+
+try:
+    assert drain_until(b"resized terminal", 3), "FatPix did not reach its public file view"
+    os.write(master, b"C")
+    assert drain_until(b"Clarity semantic view:", 15), "C did not activate the Clarity bridge"
+    os.write(master, b"c")
+    assert drain_until(b"bootstrap_code", 3), "FatPix did not retain/render the MBR structural view"
+    assert b"boot_signature" in output, "MBR signature annotation was not retained"
+    os.write(master, b"q")
+    proc.wait(timeout=3)
+    assert proc.returncode == 0
+finally:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+    os.close(master)
+    open(capture, "wb").write(output)
 PY
 
 dd if=/dev/zero of="$tmp/blank-real-negative" bs=65536 count=1 2>/dev/null
