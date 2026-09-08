@@ -2251,6 +2251,11 @@ def auto_ksy_views(
     for relative in _iter_ksy_relatives():
         if len(out) >= limit:
             break
+        # MBR has deliberately stricter coherence checks below; its ubiquitous
+        # 55 aa trailer is also present on FAT boot sectors and must not enter
+        # the generic literal-only identity path.
+        if relative == MBR_KSY_RELATIVE:
+            continue
         path = resolve_ksy_path(relative)
         if path is None:
             continue
@@ -2291,10 +2296,11 @@ def auto_ksy_views(
                 # Two- and four-byte signatures may nominate an object only at
                 # their statically expected position.  Do not hunt arbitrary
                 # payloads for cheap short-magic coincidences.
-                if len(magic) < 5:
-                    match = anchor_offset if data[anchor_offset:anchor_offset + len(magic)] == magic else -1
-                else:
-                    match = data.find(magic, search_from)
+                # KSY auto-identification describes the supplied object root.
+                # Even long literals can occur cheaply inside payloads, so bind
+                # every nomination to its statically derived root-relative
+                # position. Embedded-object discovery requires separate context.
+                match = anchor_offset if data[anchor_offset:anchor_offset + len(magic)] == magic else -1
                 if match < 0:
                     break
                 search_from = match + 1

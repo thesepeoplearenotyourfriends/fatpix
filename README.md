@@ -8,6 +8,13 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Restored the general Clarity, Garble, falsification, privacy, and JSON contract
+  tests while keeping real-corpus KSY format acceptance separate.
+- Prevented FAT boot sectors from being promoted as MBR identity through generic
+  KSY signature nomination.
+
+### 2026-09-08
+
 - Clarity now nominates short KSY signatures conservatively, retains proven
   structure after later parser failures, and automatically recognizes real PNG,
   ELF, ZIP, gzip, ISO9660, and SQLite specimens.
