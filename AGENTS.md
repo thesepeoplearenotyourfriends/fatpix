@@ -173,6 +173,14 @@ Avoid silently adding network behavior, telemetry, background services, heavywei
 
 Keep changes proportional to the problem. The project should remain something a person can understand by reading the source rather than a framework that happens to contain a binary inspector.
 
-Changelog
+## Validation: 
+
+Codex owns validation. Before opening or updating a PR, run the relevant tests yourself and report the actual results; do not merely add tests for someone else to run. The test suite is cumulative: extend existing coverage rather than replacing or deleting unrelated regression tests to make room for new acceptance tests. test.sh should retain Clarity/Garble mechanics, metrology, falsification, and regression coverage while also exercising real /test specimens end-to-end against the authoritative /kaitai corpus. Checked-in /test specimens and /kaitai definitions are inputs to the tests; do not regenerate, substitute, or download replacements for them during ordinary test runs.
+
+## On scope: 
+
+When changing the KSY interpreter itself, tie the change to a specific construct encountered in a real /kaitai definition or a demonstrated parser defect; do not broaden the parser speculatively.
+
+## Changelog maintenance:
 
 Maintain the project changelog in README.md, newest entries first. Every PR must update it. Treat the changelog as a concise historical record, not a second copy of the PR description: say plainly what changed, what was added, fixed, removed, or altered in behavior, and leave out promotional language, ceremony, implementation play-by-play, and inflated summaries. A reader scanning the README months later should be able to understand the project’s evolution quickly from the changelog alone.
