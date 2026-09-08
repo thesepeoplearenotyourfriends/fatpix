@@ -1006,6 +1006,30 @@ check_real_identity test/ext2.img ext2
 [ -f test/cmd.exe ] || { echo "FAIL: missing acceptance specimen test/cmd.exe" >&2; exit 1; }
 check_real_identity test/cmd.exe microsoft_pe
 
+# The in-stream specimen is a truncated cpio member: its ELF header and scalar
+# constraints are present at offset 832, while its section table lies beyond the
+# available bytes.  Preserve that proven local structure without promoting the
+# enclosing stream to ELF identity.
+./clarity.py --analyze --json test/elf_x86_64_in-stream.elf > "$tmp/in-stream-elf.json"
+python3 - "$tmp/in-stream-elf.json" <<'PY'
+import json, sys
+
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+views = [
+    view for view in obj.get("views", [])
+    if view.get("ksy_id") == "elf" and view.get("offset") == 832
+]
+if len(views) != 1:
+    raise SystemExit(f"FAIL: expected one ELF structural view at offset 832; got {len(views)}")
+view = views[0]
+if not view.get("partial") or view.get("strong_identity"):
+    raise SystemExit("FAIL: truncated embedded ELF must remain a partial structural view")
+if not any("section_headers offset outside selected stream" in issue for issue in view.get("issues", [])):
+    raise SystemExit(f"FAIL: missing ELF truncation reason: {view.get('issues', [])}")
+if any(claim.get("kind") in {"elf", "ksy_identity"} for claim in obj.get("claims", [])):
+    raise SystemExit("FAIL: partial embedded ELF was incorrectly promoted to identity")
+PY
+
 # Identity and byte-map acceptance are deliberately separate.  A known whole
 # file is fully projected only when annotations owned by its primary format
 # cover byte 0 through EOF.  JPEG and gzip are positive controls.  PNG, ZIP,

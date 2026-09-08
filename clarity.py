@@ -2364,10 +2364,14 @@ def auto_ksy_views(
             search_from = 0
             matches = 0
             while len(out) < limit:
-                # Two- and four-byte signatures may nominate an object only at
-                # their statically expected position.  Do not hunt arbitrary
-                # payloads for cheap short-magic coincidences.
-                if len(magic) < 5:
+                # Cheap or repetitive short signatures may nominate an object
+                # only at their statically expected position.  A four-byte
+                # signature with four distinct values is selective enough to
+                # expose an embedded structural candidate; the root-offset
+                # identity rule below still prevents that clue alone from
+                # becoming a whole-input claim.
+                globally_distinct = len(magic) > 4 or (len(magic) == 4 and len(set(magic)) == 4)
+                if not globally_distinct:
                     # Common short clues are local corroborators: they can
                     # nominate the supplied root, but are never scanned across
                     # arbitrary payload bytes.
@@ -2500,6 +2504,11 @@ def auto_ksy_views(
                     ),
                 }
                 independent = sum(bool(value) for key, value in evidence.items() if key != "anchor")
+                # An embedded four-byte clue also needs parsed corroboration to
+                # remain visible.  This keeps coincidental words such as WAVE
+                # in arbitrary payload bytes from becoming partial views.
+                if len(magic) == 4 and root_local != 0 and independent < 1:
+                    continue
                 strong = not failed and root_local == 0 and independent >= 1
                 out.append({
                     "kind": "ksy_structure",
