@@ -469,7 +469,6 @@ class RawTerminal:
     )
     _NAVIGATION_EVENTS = frozenset({
         "UP", "DOWN", "LEFT", "RIGHT", "PGUP", "PGDN",
-        "w", "a", "s", "d", "h", "j", "k", "l",
     })
     _MAX_QUEUED_NAVIGATION = 5
 

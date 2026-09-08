@@ -89,11 +89,15 @@ done
 python3 - "$tmp/xor.grb" "$tmp/subst.grb" "$tmp/shuffle.grb" <<'PY'
 from pathlib import Path
 import sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 for path, transform_id in ((sys.argv[1], 1), (sys.argv[2], 2), (sys.argv[3], 3)):
     b = Path(path).read_bytes()[:16]
-    assert b[:8] == b'GRBLv1\r\n'
-    assert b[8] == 1 and b[9] == transform_id and b[10:12] == b'\0\0'
-    assert int.from_bytes(b[12:16], 'little') == 16
+    require(b[:8] == b'GRBLv1\r\n', "assertion failed: b[:8] == b'GRBLv1\\r\\n'")
+    require(b[8] == 1 and b[9] == transform_id and (b[10:12] == b'\x00\x00'), "assertion failed: b[8] == 1 and b[9] == transform_id and (b[10:12] == b'\\x00\\x00')")
+    require(int.from_bytes(b[12:16], 'little') == 16, "assertion failed: int.from_bytes(b[12:16], 'little') == 16")
 PY
 if ./garble -d -t xor -k BlueVelvet "$tmp/xor.grb" "$tmp/nope" >/dev/null 2>&1; then
     echo "FAIL: decode accepted encode-only -t" >&2
@@ -162,24 +166,36 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 fatpix = importlib.util.module_from_spec(spec)
 loader.exec_module(fatpix)
 
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + message)
+
 def terminal():
     return fatpix.RawTerminal(-1)
 
 t = terminal()
 t._input.extend(b"\x1b[6~" * 500)
 t._parse_input()
-assert list(t._events) == ["PGDN"] * t._MAX_QUEUED_NAVIGATION
+require(list(t._events) == ["PGDN"] * t._MAX_QUEUED_NAVIGATION,
+        "encoded PgDn repeat queue was not bounded")
 
 # Non-navigation input remains lossless behind a saturated movement queue.
 t._input.extend(b"x")
 t._parse_input()
-assert list(t._events)[-1] == "x"
+require(list(t._events)[-1] == "x", "non-navigation input was dropped")
 
 # Ctrl-C preempts and discards only navigation; the unrelated event survives.
 t._input.extend(b"\x03")
 t._parse_input()
-assert t.read_key() == "QUIT"
-assert list(t._events) == ["x"]
+require(t.read_key() == "QUIT", "Ctrl-C did not preempt navigation")
+require(list(t._events) == ["x"], "Ctrl-C discarded unrelated input")
+
+# Literal command/text bytes are ambiguous until the UI state is known and
+# therefore remain lossless at RawTerminal's state-agnostic boundary.
+t = terminal()
+t._input.extend(b"a" * 500)
+t._parse_input()
+require(list(t._events) == ["a"] * 500, "literal text was throttled as navigation")
 
 # Ordinary encoded movements retain their established event names.  Drain each
 # event to show that repeated reads continue to navigate normally.
@@ -192,7 +208,7 @@ for raw, expected in (
     t = terminal()
     t._input.extend(raw)
     t._parse_input()
-    assert t.read_key() == expected
+    require(t.read_key() == expected, f"single {expected} event changed")
 
 print("RawTerminal navigation queue: bounded repeats, lossless commands, preemptive quit")
 PY
@@ -235,15 +251,14 @@ PY
 python3 clarity.py --json "$tmp/mixed-structure.bin" > "$tmp/mixed-structure.json"
 python3 - "$tmp/mixed-structure.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 regions = obj["structure"]["regions"]
-assert [(r["start"], r["end"], r["kind"]) for r in regions] == [
-    (0, 1024, "ascii_compatible"),
-    (1024, 2048, "fill"),
-    (2048, 3072, "high_entropy"),
-    (3072, 4096, "other"),
-]
-assert regions[1]["fill_byte"] == 0xff
+require([(r['start'], r['end'], r['kind']) for r in regions] == [(0, 1024, 'ascii_compatible'), (1024, 2048, 'fill'), (2048, 3072, 'high_entropy'), (3072, 4096, 'other')], "assertion failed: [(r['start'], r['end'], r['kind']) for r in regions] == [(0, 1024, 'ascii_compatible'), (1024, 2048, 'fill'), (2048, 3072, 'high_entropy'), (3072, 4096, 'other')]")
+require(regions[1]['fill_byte'] == 255, "assertion failed: regions[1]['fill_byte'] == 255")
 PY
 
 # MBR is the first structured "view": exact field ranges remain available in JSON,
@@ -263,29 +278,37 @@ PY
 python3 clarity.py --json --base-offset 0x2000 "$tmp/mbr.bin" > "$tmp/mbr.json"
 python3 - "$tmp/mbr.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 claims = [c for c in obj["claims"] if c["kind"] == "mbr_partition_table"]
-assert len(claims) == 1 and claims[0]["offset"] == 0x2000
-assert obj["base_offset"] == 0x2000
+require(len(claims) == 1 and claims[0]['offset'] == 8192, "assertion failed: len(claims) == 1 and claims[0]['offset'] == 8192")
+require(obj['base_offset'] == 8192, "assertion failed: obj['base_offset'] == 8192")
 view = obj["views"][0]
-assert view["strong_identity"] is True
-assert view["shape_source"] == "kaitai/filesystem/mbr_partition_table.ksy"
+require(view['strong_identity'] is True, "assertion failed: view['strong_identity'] is True")
+require(view['shape_source'] == 'kaitai/filesystem/mbr_partition_table.ksy', "assertion failed: view['shape_source'] == 'kaitai/filesystem/mbr_partition_table.ksy'")
 by_path = {a["path"]: a for a in view["annotations"]}
-assert (by_path["mbr.bootstrap_code"]["start"], by_path["mbr.bootstrap_code"]["end"]) == (0x2000, 0x21be)
-assert (by_path["mbr.partitions[0].lba_start"]["start"], by_path["mbr.partitions[0].lba_start"]["end"]) == (0x21c6, 0x21ca)
-assert by_path["mbr.partitions[0].lba_start"]["value"] == 2048
+require((by_path['mbr.bootstrap_code']['start'], by_path['mbr.bootstrap_code']['end']) == (8192, 8638), "assertion failed: (by_path['mbr.bootstrap_code']['start'], by_path['mbr.bootstrap_code']['end']) == (8192, 8638)")
+require((by_path['mbr.partitions[0].lba_start']['start'], by_path['mbr.partitions[0].lba_start']['end']) == (8646, 8650), "assertion failed: (by_path['mbr.partitions[0].lba_start']['start'], by_path['mbr.partitions[0].lba_start']['end']) == (8646, 8650)")
+require(by_path['mbr.partitions[0].lba_start']['value'] == 2048, "assertion failed: by_path['mbr.partitions[0].lba_start']['value'] == 2048")
 PY
 cp "$tmp/mbr.bin" "$tmp/mbr-damaged.bin"
 printf '\0\0' | dd of="$tmp/mbr-damaged.bin" bs=1 seek=510 conv=notrunc status=none
 python3 clarity.py --json "$tmp/mbr-damaged.bin" > "$tmp/mbr-damaged.json"
 python3 - "$tmp/mbr-damaged.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-assert not [c for c in obj["claims"] if c["kind"] == "mbr_partition_table"]
-assert len(obj["views"]) == 1
+require(not [c for c in obj['claims'] if c['kind'] == 'mbr_partition_table'], "assertion failed: not [c for c in obj['claims'] if c['kind'] == 'mbr_partition_table']")
+require(len(obj['views']) == 1, "assertion failed: len(obj['views']) == 1")
 view = obj["views"][0]
-assert view["checks_passed"] == 9 and not view["strong_identity"]
-assert "boot signature 55 aa absent" in view["hard_contradictions"]
+require(view['checks_passed'] == 9 and (not view['strong_identity']), "assertion failed: view['checks_passed'] == 9 and (not view['strong_identity'])")
+require('boot signature 55 aa absent' in view['hard_contradictions'], "assertion failed: 'boot signature 55 aa absent' in view['hard_contradictions']")
 PY
 
 # A structurally consistent ELF hidden behind unrelated bytes should earn identity;
@@ -353,33 +376,45 @@ grep -q 'recovered position mapping: PR:\[redacted by --private\]' "$tmp/shuffle
 python3 clarity.py --json --known "$tmp/probe-plain.bin" "$tmp/probe-subst.grb" > "$tmp/result.json"
 python3 - "$tmp/result.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-assert obj["stats"]["bytes"] > 0
-assert isinstance(obj["claims"], list)
-assert isinstance(obj["abstentions"], list)
-assert isinstance(obj["views"], list)
-assert obj["base_offset"] == 0
-assert obj["known_plaintext"]["kind"] == "fixed_byte_substitution"
-assert obj["known_plaintext"]["offset"] == 16
-assert obj["known_plaintext"]["observed_symbols"] == 256
-assert obj["known_plaintext"]["mapping_pr"].startswith("PR:[")
+require(obj['stats']['bytes'] > 0, "assertion failed: obj['stats']['bytes'] > 0")
+require(isinstance(obj['claims'], list), "assertion failed: isinstance(obj['claims'], list)")
+require(isinstance(obj['abstentions'], list), "assertion failed: isinstance(obj['abstentions'], list)")
+require(isinstance(obj['views'], list), "assertion failed: isinstance(obj['views'], list)")
+require(obj['base_offset'] == 0, "assertion failed: obj['base_offset'] == 0")
+require(obj['known_plaintext']['kind'] == 'fixed_byte_substitution', "assertion failed: obj['known_plaintext']['kind'] == 'fixed_byte_substitution'")
+require(obj['known_plaintext']['offset'] == 16, "assertion failed: obj['known_plaintext']['offset'] == 16")
+require(obj['known_plaintext']['observed_symbols'] == 256, "assertion failed: obj['known_plaintext']['observed_symbols'] == 256")
+require(obj['known_plaintext']['mapping_pr'].startswith('PR:['), "assertion failed: obj['known_plaintext']['mapping_pr'].startswith('PR:[')")
 PY
 python3 clarity.py --json --private --known "$tmp/probe-plain.bin" "$tmp/probe-subst.grb" > "$tmp/private.json"
 python3 - "$tmp/private.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-assert obj["known_plaintext"]["mapping_pr"] == "PR:[redacted by --private]"
+require(obj['known_plaintext']['mapping_pr'] == 'PR:[redacted by --private]', "assertion failed: obj['known_plaintext']['mapping_pr'] == 'PR:[redacted by --private]'")
 PY
 python3 clarity.py --json --known "$tmp/probe-plain.bin" "$tmp/probe-shuffle.grb" > "$tmp/shuffle.json"
 python3 - "$tmp/shuffle.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-assert obj["known_plaintext"]["kind"] == "fixed_block_position_permutation"
-assert obj["known_plaintext"]["offset"] == 16
-assert obj["known_plaintext"]["block_size"] == 16
-assert obj["known_plaintext"]["verified_bytes"] % 16 == 0
-assert obj["known_plaintext"]["trailing_bytes"] == 8
-assert obj["known_plaintext"]["mapping_pr"].startswith("PR:[out->in ")
+require(obj['known_plaintext']['kind'] == 'fixed_block_position_permutation', "assertion failed: obj['known_plaintext']['kind'] == 'fixed_block_position_permutation'")
+require(obj['known_plaintext']['offset'] == 16, "assertion failed: obj['known_plaintext']['offset'] == 16")
+require(obj['known_plaintext']['block_size'] == 16, "assertion failed: obj['known_plaintext']['block_size'] == 16")
+require(obj['known_plaintext']['verified_bytes'] % 16 == 0, "assertion failed: obj['known_plaintext']['verified_bytes'] % 16 == 0")
+require(obj['known_plaintext']['trailing_bytes'] == 8, "assertion failed: obj['known_plaintext']['trailing_bytes'] == 8")
+require(obj['known_plaintext']['mapping_pr'].startswith('PR:[out->in '), "assertion failed: obj['known_plaintext']['mapping_pr'].startswith('PR:[out->in ')")
 PY
 
 # --- Bullshit-fuzzer 1: ciphertext-only periodicity claim vs hostile near-misses. ---
@@ -387,6 +422,10 @@ PY
 python3 - <<'PY'
 import random
 import clarity
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
 
 rng = random.Random(0xC1A17A)
 tp = fp = fn = tn = wrong = 0
@@ -435,8 +474,8 @@ for _ in range(50):
     else:
         fp += 1
 
-assert tp + fn == 100
-assert fp + tn == 200
+require(tp + fn == 100, 'assertion failed: tp + fn == 100')
+require(fp + tn == 200, 'assertion failed: fp + tn == 200')
 precision = tp / (tp + fp + wrong) if (tp + fp + wrong) else 1.0
 recall = tp / (tp + fn) if (tp + fn) else 1.0
 print(
@@ -551,6 +590,10 @@ python3 - <<'PY'
 import random
 import clarity
 
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 rng = random.Random(0xB10C5)
 tp = fp = fn = tn = wrong = 0
 
@@ -649,8 +692,8 @@ for _ in range(40):
     else:
         fp += 1
 
-assert tp + fn == 100
-assert fp + tn == 200
+require(tp + fn == 100, 'assertion failed: tp + fn == 100')
+require(fp + tn == 200, 'assertion failed: fp + tn == 200')
 precision = tp / (tp + fp + wrong) if (tp + fp + wrong) else 1.0
 recall = tp / (tp + fn) if (tp + fn) else 1.0
 print(
@@ -712,6 +755,10 @@ PY
 python3 - <<'PY'
 import random
 import clarity
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
 
 rng = random.Random(0xE1F1D)
 tp = fp = fn = tn = wrong = 0
@@ -815,8 +862,8 @@ for _ in range(100):
     else:
         tn += 1
 
-assert tp + fn == 100
-assert fp + tn == 200
+require(tp + fn == 100, 'assertion failed: tp + fn == 100')
+require(fp + tn == 200, 'assertion failed: fp + tn == 200')
 precision = tp / (tp + fp + wrong) if (tp + fp + wrong) else 1.0
 recall = tp / (tp + fn) if (tp + fn) else 1.0
 print(
@@ -834,6 +881,10 @@ PY
 python3 - <<'PY'
 import random
 import clarity
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
 
 rng = random.Random(0x4D4252)
 tp = fp = fn = tn = wrong = 0
@@ -897,9 +948,9 @@ for _ in range(100):
     else:
         tn += 1
 
-assert tp + fn == 100
-assert partial_ok + partial_wrong == 100
-assert fp + tn == 100
+require(tp + fn == 100, 'assertion failed: tp + fn == 100')
+require(partial_ok + partial_wrong == 100, 'assertion failed: partial_ok + partial_wrong == 100')
+require(fp + tn == 100, 'assertion failed: fp + tn == 100')
 precision = tp / (tp + fp + wrong) if (tp + fp + wrong) else 1.0
 recall = tp / (tp + fn) if (tp + fn) else 1.0
 print(
@@ -920,6 +971,9 @@ check_real_identity() {
 import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 expected, specimen = sys.argv[2:]
+def require(condition, message):
+    if not condition:
+        raise SystemExit(f"FAIL: {specimen}: {message}")
 views = obj.get("views", [])
 matches = [v for v in views if v.get("ksy_id") == expected and v.get("strong_identity")]
 if not matches:
@@ -927,8 +981,9 @@ if not matches:
     raise SystemExit(f"FAIL: {specimen} did not earn {expected} identity; views={detail}")
 for view in matches:
     evidence = view.get("evidence", {})
-    assert evidence.get("anchor") == 1
-    assert any(value for key, value in evidence.items() if key != "anchor"), evidence
+    require(evidence.get("anchor") == 1, "identity lacks its anchor evidence")
+    require(any(value for key, value in evidence.items() if key != "anchor"),
+            f"identity lacks independent evidence: {evidence}")
 PY
 }
 
@@ -960,18 +1015,22 @@ check_real_identity test/cmd.exe microsoft_pe
 check_real_projection() {
     specimen=$1
     expected=$2
-    expected_holes=$3
     ./clarity.py --analyze --json "$specimen" > "$tmp/real-projection.json"
-    python3 - "$tmp/real-projection.json" "$specimen" "$expected" "$expected_holes" <<'PY'
+    python3 - "$tmp/real-projection.json" "$specimen" "$expected" <<'PY'
 import json, os, sys
 
-result_path, specimen, expected, encoded_holes = sys.argv[1:]
+result_path, specimen, expected = sys.argv[1:]
 obj = json.load(open(result_path, encoding="utf-8"))
 size = os.path.getsize(specimen)
-views = [v for v in obj.get("views", []) if v.get("ksy_id") == expected]
+roots = [
+    v for v in obj.get("views", [])
+    if v.get("ksy_id") == expected and v.get("offset") == 0 and v.get("strong_identity")
+]
+if len(roots) != 1:
+    raise SystemExit(f"FAIL: {specimen} expected one strong {expected} root at 0; got {len(roots)}")
+view = roots[0]
 intervals = sorted(
     (max(0, int(a["start"])), min(size, int(a["end"])))
-    for view in views
     for a in view.get("annotations", [])
     if int(a.get("end", 0)) > int(a.get("start", 0))
 )
@@ -991,27 +1050,37 @@ for start, end in covered:
     cursor = max(cursor, end)
 if cursor < size:
     holes.append([cursor, size])
-expected_holes = [] if encoded_holes == "none" else [
-    [int(start), int(end)]
-    for item in encoded_holes.split(",")
-    for start, end in [item.split(":")]
+competing = [
+    (v.get("ksy_id", v.get("kind")), v.get("offset"), v.get("extent"),
+     v.get("strong_identity"), v.get("partial"), v.get("issues"))
+    for v in obj.get("views", []) if v is not view
+    if int(v.get("offset", -1)) < size and int(v.get("offset", -1)) + int(v.get("extent", 0)) > 0
 ]
-assert holes == expected_holes, (
-    f"{specimen} {expected} projection changed: size={size}, "
-    f"views={[(v.get('offset'), v.get('extent'), v.get('partial'), v.get('issues')) for v in views]}, "
-    f"covered={covered}, holes={holes}"
+print(
+    f"projection audit: {specimen} expected=0:{size} identity={expected} "
+    f"view={(view.get('offset'), view.get('extent'))} covered={covered} holes={holes} "
+    f"partial={view.get('partial')} issues={view.get('issues')} competing={competing}"
 )
-state = "full" if not holes else "known-incomplete"
-print(f"projection {state}: {specimen} {expected} size={size} covered={covered} holes={holes}")
+if holes:
+    raise SystemExit(f"FAIL: {specimen} {expected} leaves uncovered ranges {holes}")
 PY
 }
 
-check_real_projection test/george2.jpg jpeg none
-check_real_projection test/george.gz gzip none
-check_real_projection test/george.tar.gz gzip none
-check_real_projection test/sample.png png 54:131308
-check_real_projection test/george.zip zip 10116:10153
-check_real_projection test/sample.sqlite sqlite3 112:12288
+check_real_projection test/george2.jpg jpeg
+check_real_projection test/george.gz gzip
+check_real_projection test/george.tar.gz gzip
+
+projection_failures=0
+for specimen_and_format in \
+    "test/sample.png png" \
+    "test/george.zip zip" \
+    "test/sample.sqlite sqlite3"
+do
+    set -- $specimen_and_format
+    if ! check_real_projection "$1" "$2"; then
+        projection_failures=$((projection_failures + 1))
+    fi
+done
 
 # WAV owns the whole file in the whole-file result, but is not a projection pass:
 # an equally broad AVI hypothesis overlaps it and can win FatPix field painting.
@@ -1022,8 +1091,10 @@ obj = json.load(open(sys.argv[1], encoding="utf-8"))
 size = os.path.getsize("test/sample.wav")
 wav = [v for v in obj["views"] if v.get("ksy_id") == "wav"]
 avi = [v for v in obj["views"] if v.get("ksy_id") == "avi"]
-assert any(v["offset"] == 0 and v["extent"] == size and v.get("strong_identity") for v in wav)
-assert any(v["offset"] == 0 and v["extent"] == size for v in avi)
+if not any(v["offset"] == 0 and v["extent"] == size and v.get("strong_identity") for v in wav):
+    raise SystemExit("FAIL: WAV audit lost its whole-file primary view")
+if not any(v["offset"] == 0 and v["extent"] == size for v in avi):
+    raise SystemExit("FAIL: WAV audit no longer reproduces the competing AVI view")
 print(f"projection known-ambiguous: test/sample.wav size={size} wav=0:{size} competing_avi=0:{size}")
 PY
 
@@ -1037,7 +1108,8 @@ for specimen in test/fat.img test/ext2.img; do
 import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 views = [v for v in obj["views"] if v.get("strong_identity")]
-assert views and any(v.get("partial") and v.get("issues") for v in views), sys.argv[2]
+if not views or not any(v.get("partial") and v.get("issues") for v in views):
+    raise SystemExit("FAIL: expected explicit partial/issues state for " + sys.argv[2])
 PY
 done
 
@@ -1049,11 +1121,15 @@ printf 'JUNK' | dd of="$tmp/png-near-miss" bs=1 seek=12 conv=notrunc status=none
 ./clarity.py --analyze --json "$tmp/png-near-miss" > "$tmp/png-near-miss.json"
 python3 - "$tmp/png-near-miss.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 views = [v for v in obj["views"] if v.get("ksy_id") == "png"]
-assert views, "PNG signature should still nominate a visible candidate"
-assert not any(v.get("strong_identity") for v in views)
-assert any(v.get("hard_contradictions") for v in views)
+require(views, 'PNG signature should still nominate a visible candidate')
+require(not any((v.get('strong_identity') for v in views)), "assertion failed: not any((v.get('strong_identity') for v in views))")
+require(any((v.get('hard_contradictions') for v in views)), "assertion failed: any((v.get('hard_contradictions') for v in views))")
 PY
 
 # PE's cheap MZ clue survives, but the root-relative PE signature predicted by
@@ -1061,21 +1137,29 @@ PY
 cp test/cmd.exe "$tmp/pe-near-miss"
 python3 - "$tmp/pe-near-miss" <<'PY'
 import sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 p = sys.argv[1]
 b = bytearray(open(p, "rb").read())
 ofs = int.from_bytes(b[0x3c:0x40], "little")
-assert b[ofs:ofs + 4] == b"PE\0\0"
+require(b[ofs:ofs + 4] == b'PE\x00\x00', "assertion failed: b[ofs:ofs + 4] == b'PE\\x00\\x00'")
 b[ofs:ofs + 4] = b"PX\0\0"
 open(p, "wb").write(b)
 PY
 ./clarity.py --analyze --json "$tmp/pe-near-miss" > "$tmp/pe-near-miss.json"
 python3 - "$tmp/pe-near-miss.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 views = [v for v in obj["views"] if v.get("ksy_id") == "microsoft_pe"]
-assert views, "MZ should retain the PE candidate hypothesis"
-assert not any(v.get("strong_identity") for v in views)
-assert any(v.get("hard_contradictions") for v in views)
+require(views, 'MZ should retain the PE candidate hypothesis')
+require(not any((v.get('strong_identity') for v in views)), "assertion failed: not any((v.get('strong_identity') for v in views))")
+require(any((v.get('hard_contradictions') for v in views)), "assertion failed: any((v.get('hard_contradictions') for v in views))")
 PY
 
 # Strong anchors remain root-relative during structural scanning. Two complete
@@ -1089,11 +1173,15 @@ PY
 ./clarity.py --analyze --json --windowed "$tmp/two-embedded-pngs" > "$tmp/two-embedded.json"
 python3 - "$tmp/two-embedded.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 pngs = [v for v in obj["views"] if v.get("ksy_id") == "png"]
-assert len({v["offset"] for v in pngs}) == 2
-assert all(not v.get("strong_identity") for v in pngs)
-assert not any(v.get("ksy_id") == "zip" for v in obj["views"])
+require(len({v['offset'] for v in pngs}) == 2, "assertion failed: len({v['offset'] for v in pngs}) == 2")
+require(all((not v.get('strong_identity') for v in pngs)), "assertion failed: all((not v.get('strong_identity') for v in pngs))")
+require(not any((v.get('ksy_id') == 'zip' for v in obj['views'])), "assertion failed: not any((v.get('ksy_id') == 'zip' for v in obj['views']))")
 PY
 
 # Real MBR acceptance must follow the same public paths as a user.  Keep both
@@ -1106,15 +1194,15 @@ grep -F "CLAIM: structurally consistent MBR partition table" "$tmp/real-mbr.txt"
 ./clarity.py --analyze --json test/mbr.img > "$tmp/real-mbr.json"
 python3 - "$tmp/real-mbr.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-assert any(c.get("kind") == "mbr_partition_table" for c in obj.get("claims", []))
+require(any((c.get('kind') == 'mbr_partition_table' for c in obj.get('claims', []))), "assertion failed: any((c.get('kind') == 'mbr_partition_table' for c in obj.get('claims', [])))")
 views = [v for v in obj.get("views", []) if v.get("kind") == "mbr_partition_table"]
-assert any(v.get("offset") == 0 and v.get("strong_identity") for v in views)
-assert any(
-    a.get("path") == "mbr.boot_signature"
-    for v in views if v.get("offset") == 0
-    for a in v.get("annotations", [])
-)
+require(any((v.get('offset') == 0 and v.get('strong_identity') for v in views)), "assertion failed: any((v.get('offset') == 0 and v.get('strong_identity') for v in views))")
+require(any((a.get('path') == 'mbr.boot_signature' for v in views if v.get('offset') == 0 for a in v.get('annotations', []))), "assertion failed: any((a.get('path') == 'mbr.boot_signature' for v in views if v.get('offset') == 0 for a in v.get('annotations', [])))")
 PY
 
 # Drive the real terminal application through a pseudo-terminal: launch the
@@ -1122,6 +1210,10 @@ PY
 # retained overlay contains fields supplied by Clarity's MBR view.
 python3 - "$tmp/fatpix-mbr.tty" <<'PY'
 import os, pty, select, subprocess, sys, time
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
 
 capture = sys.argv[1]
 master, slave = pty.openpty()
@@ -1150,15 +1242,15 @@ def drain_until(needle, timeout):
     return needle in output
 
 try:
-    assert drain_until(b"resized terminal", 3), "FatPix did not reach its public file view"
+    require(drain_until(b'resized terminal', 3), 'FatPix did not reach its public file view')
     os.write(master, b"C")
-    assert drain_until(b"Clarity semantic view:", 15), "C did not activate the Clarity bridge"
+    require(drain_until(b'Clarity semantic view:', 15), 'C did not activate the Clarity bridge')
     os.write(master, b"c")
-    assert drain_until(b"bootstrap_code", 3), "FatPix did not retain/render the MBR structural view"
-    assert b"boot_signature" in output, "MBR signature annotation was not retained"
+    require(drain_until(b'bootstrap_code', 3), 'FatPix did not retain/render the MBR structural view')
+    require(b'boot_signature' in output, 'MBR signature annotation was not retained')
     os.write(master, b"q")
     proc.wait(timeout=3)
-    assert proc.returncode == 0
+    require(proc.returncode == 0, 'assertion failed: proc.returncode == 0')
 finally:
     if proc.poll() is None:
         proc.kill()
@@ -1176,9 +1268,18 @@ for specimen in "$tmp/blank-real-negative" "$tmp/random-real-negative"; do
     ./clarity.py --analyze --json "$specimen" > "$tmp/real-negative.json"
     python3 - "$tmp/real-negative.json" <<'PY'
 import json, sys
+def require(condition, message):
+    if not condition:
+        raise SystemExit("FAIL: " + str(message))
+
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
-assert not any(v.get("strong_identity") for v in obj.get("views", []))
+require(not any((v.get('strong_identity') for v in obj.get('views', []))), "assertion failed: not any((v.get('strong_identity') for v in obj.get('views', [])))")
 PY
 done
+
+if [ "$projection_failures" -ne 0 ]; then
+    echo "FAIL: $projection_failures known whole-file projection acceptance check(s) remain incomplete" >&2
+    exit 1
+fi
 
 echo "PASS: mechanics + metrology + stats/analyze/JSON contracts + 1800-case truth universe + real KSY acceptance"
