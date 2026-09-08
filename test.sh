@@ -890,6 +890,28 @@ check_real_ksy test/george.gz gzip
 check_real_ksy test/george.tar.gz gzip
 check_real_ksy test/sample.iso iso9660
 check_real_ksy test/sample.sqlite sqlite3
+check_real_ksy test/sample.avi avi
+check_real_ksy test/sample.mp3 id3v2_3
+# This specimen's suffix is misleading; its bytes are an ordinary gzip stream.
+check_real_ksy test/george.jpg gzip
+
+# Strong anchors remain root-relative during structural scanning. Two complete
+# PNGs at nonzero offsets must yield two hypotheses, while common PK bytes in the
+# surrounding payload must not nominate embedded ZIP identities.
+python3 - <<'PY' > "$tmp/two-embedded-pngs"
+import sys
+png = open("test/sample.png", "rb").read()
+sys.stdout.buffer.write(b"prefix-PK-noise" + png + b"middle-PK-noise" + png + b"tail")
+PY
+./clarity.py --analyze --json --windowed "$tmp/two-embedded-pngs" > "$tmp/two-embedded.json"
+python3 - "$tmp/two-embedded.json" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+pngs = [v for v in obj["views"] if v.get("ksy_id") == "png"]
+assert len({v["offset"] for v in pngs}) == 2
+assert all(not v.get("strong_identity") for v in pngs)
+assert not any(v.get("ksy_id") == "zip" for v in obj["views"])
+PY
 
 # Real MBR follows its dedicated structural-coherence path backed by the real KSY.
 ./clarity.py --analyze --json test/mbr.img > "$tmp/real-mbr.json"

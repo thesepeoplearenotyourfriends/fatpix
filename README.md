@@ -12,6 +12,10 @@ binary analyzer, and Garble provides reversible transformations.
   tests while keeping real-corpus KSY format acceptance separate.
 - Prevented FAT boot sectors from being promoted as MBR identity through generic
   KSY signature nomination.
+- Restored root-relative embedded scanning for distinctive KSY clues while
+  keeping short clues local to an existing candidate root.
+- Added real AVI and ID3/MP3 acceptance and root-relative multi-object scanning
+  coverage.
 
 ### 2026-09-08
 

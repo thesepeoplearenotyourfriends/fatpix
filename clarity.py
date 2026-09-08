@@ -2296,11 +2296,15 @@ def auto_ksy_views(
                 # Two- and four-byte signatures may nominate an object only at
                 # their statically expected position.  Do not hunt arbitrary
                 # payloads for cheap short-magic coincidences.
-                # KSY auto-identification describes the supplied object root.
-                # Even long literals can occur cheaply inside payloads, so bind
-                # every nomination to its statically derived root-relative
-                # position. Embedded-object discovery requires separate context.
-                match = anchor_offset if data[anchor_offset:anchor_offset + len(magic)] == magic else -1
+                if len(magic) < 5:
+                    # Common short clues are local corroborators: they can
+                    # nominate the supplied root, but are never scanned across
+                    # arbitrary payload bytes.
+                    match = anchor_offset if data[anchor_offset:anchor_offset + len(magic)] == magic else -1
+                else:
+                    # A distinctive global clue implies a candidate root in the
+                    # clue's own coordinate system, not at absolute offset zero.
+                    match = data.find(magic, search_from)
                 if match < 0:
                     break
                 search_from = match + 1
@@ -2377,7 +2381,9 @@ def auto_ksy_views(
                     "annotations": annotations,
                     "constraints": constraints,
                 })
-                break
+                # Keep looking: one source range can contain several objects of
+                # the same format. seen_candidates merges secondary clues that
+                # imply an already-investigated (format, root) hypothesis.
     return out
 
 def _mbr_ksy() -> tuple[dict, Path] | None:
@@ -2527,6 +2533,11 @@ def mbr_views(
     first = (-base_offset) % extent
     stop = len(data) - extent
     for off in range(first, stop + 1, extent):
+        # The missing-signature partial case is meaningful at a caller-proposed
+        # root, not at every sector of a large arbitrary source. Avoid parsing
+        # hundreds of obviously ineligible sectors through the full KSY.
+        if off != first and data[off + 510:off + 512] != b"\x55\xaa":
+            continue
         view = mbr_view_at(data, off, base_offset)
         if view is not None:
             out.append(view)
