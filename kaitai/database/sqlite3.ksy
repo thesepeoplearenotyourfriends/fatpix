@@ -104,6 +104,8 @@ seq:
 instances:
   len_page:
     value: 'len_page_mod == 1 ? 0x10000 : len_page_mod'
+  len_database:
+    value: len_page * num_pages
 types:
   btree_page:
     seq:

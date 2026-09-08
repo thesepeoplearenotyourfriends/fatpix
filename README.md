@@ -8,6 +8,16 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Grounded SQLite opaque-page ownership in an explicit KSY page-size/page-count
+  extent relationship instead of inferring geometry from matching scalars.
+- Completed whole-file projection for the real PNG, ZIP, SQLite, and WAV
+  specimens and suppressed contradicted same-root views beside strong identity.
+- Separated real-file identity checks from structural-coverage checks, recording
+  known PNG, ZIP, and SQLite gaps, WAV/AVI overlap, and full JPEG/gzip maps.
+- Bounded queued navigation repeats and made terminal quit input preempt stale
+  movement without dropping commands, text, or mouse events.
+- Added public-command MBR regressions for Clarity's text and JSON output and
+  FatPix's interactive `C` semantic-view path, and made `fatpix` executable.
 - Restored the general Clarity, Garble, falsification, privacy, and JSON contract
   tests while keeping real-corpus KSY format acceptance separate.
 - Prevented FAT boot sectors from being promoted as MBR identity through generic
