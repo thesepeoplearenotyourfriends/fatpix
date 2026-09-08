@@ -24,10 +24,23 @@ MBR_KSY_RELATIVE = "filesystem/mbr_partition_table.ksy"
 MBR_SHAPE_SOURCE = "kaitai/" + MBR_KSY_RELATIVE
 MAX_MBR_VIEWS = 16
 MAX_AUTO_KSY_VIEWS = 16
-AUTO_KSY_MIN_ANCHOR = 5
+AUTO_KSY_MIN_ANCHOR = 2
 
 _KSY_ROOT_OVERRIDE: Path | None = None
 _KSY_DOC_CACHE: dict[str, tuple[int, int, dict]] = {}
+
+# Some real corpus definitions express their identifying clue through enums or
+# field relationships rather than ``contents``. These are nomination clues only;
+# the KSY projection still has to corroborate them before a view is emitted.
+# Transitional hints for clues the static KSY walker cannot derive yet. Each
+# entry names the real corpus relationship that should eventually supersede it;
+# none bypasses parsing or contributes more than one evidence category.
+_CORPUS_SCOUT_CLUES = {
+    "ext2": [(1080, b"\x53\xef")],       # ext2.super_block_struct.magic
+    "jpeg": [(0, b"\xff\xd8")],          # segment magic + marker_enum::soi
+    "vfat": [(82, b"FAT32   ")],          # FAT32 EBPB filesystem type label
+    "wav": [(8, b"WAVE")],                # WAV RIFF fourcc::wave form type
+}
 
 BYTE_NAMES = {
     0x00: "NUL",
@@ -411,6 +424,18 @@ def _split_mapping_pair(text: str) -> tuple[str, str]:
 
 def _yaml_scalar(text: str):
     text = text.strip()
+    # Real KSY enum members and empty inline mappings commonly carry YAML
+    # comments (jpeg marker_enum and riff.slot are acceptance blockers).
+    quote = None
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                quote = None
+        elif ch in {"'", '"'}:
+            quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1].isspace()):
+            text = text[:i].rstrip()
+            break
     if not text:
         return None
     low = text.lower()
@@ -475,7 +500,7 @@ def parse_ksy_yaml(text: str) -> dict:
                     item, i = parse_block(i, lines[i][0])
                     out.append(item)
                     continue
-                if ":" in body:
+                if ":" in body and body[:1] not in {"'", '"'}:
                     key, value = _split_mapping_pair(body)
                     item: dict = {key: _yaml_scalar(value) if value else None}
                     if not value and i < len(lines) and lines[i][0] > indent:
@@ -497,7 +522,7 @@ def parse_ksy_yaml(text: str) -> dict:
         while i < len(lines) and lines[i][0] == indent and not lines[i][1].startswith("- "):
             key, value = _split_mapping_pair(lines[i][1])
             i += 1
-            if value in {"|", ">"}:
+            if value in {"|", ">", "|-", ">-", "|+", ">+"}:
                 chunks: list[str] = []
                 while i < len(lines) and lines[i][0] > indent:
                     chunks.append(lines[i][1])
@@ -1200,6 +1225,7 @@ def parse_ksy_structure(
     base_offset: int = 0,
     root_path: str | None = None,
     root_instance_filter: set[str] | None = None,
+    partial: bool = False,
 ) -> dict:
     """Project the supported KSY structure onto bytes without promoting identity.
 
@@ -1214,6 +1240,7 @@ def parse_ksy_structure(
     values: dict[str, object] = {}
     constraints: list[dict] = []
     pending_instances: list[tuple[str, dict, _KsyScope, int, int]] = []
+    issues: list[str] = []
 
     if offset < 0 or offset > len(data):
         raise KsyError("KSY start offset outside supplied data")
@@ -1230,6 +1257,13 @@ def parse_ksy_structure(
         row.update(extra)
         annotations.append(row)
         return row
+
+    def size_evidence(field: dict) -> dict:
+        if "size" in field:
+            return {"size_rule": field["size"]}
+        if field.get("size-eos") is True:
+            return {"size_rule": "eos"}
+        return {}
 
     def field_size(field: dict, scope: _KsyScope, cursor: int, index: int | None = None) -> int | None:
         if "size" in field:
@@ -1445,12 +1479,11 @@ def parse_ksy_structure(
             # instances lazy; eagerly parsing every such view causes nonsense
             # interpretations of objects that nobody referenced.  Root instances
             # remain eager so instance-only address-space grammars still project.
-            io_spec = spec.get("io")
-            if (
-                io_spec is not None
-                and scope.parent is not None
-                and str(io_spec).strip() not in {"_root._io", "_parent._io"}
-            ):
+            # Nested instances are lazy in Kaitai, including ones selecting the
+            # root stream. Parse them only when an expression actually refers to
+            # them; eagerly walking directory extents can recurse through `.`
+            # indefinitely and invents views no caller requested.
+            if scope.parent is not None:
                 continue
             try:
                 process_one_instance(str(instance_id), spec, scope, depth, cursor)
@@ -1499,6 +1532,8 @@ def parse_ksy_structure(
         param_values: list[object] | None = None,
         source_doc: dict | None = None,
     ) -> tuple[int, _KsyScope]:
+        if depth > 64:
+            raise KsyUnsupported(f"nested KSY structure exceeds depth limit at {path}")
         seq = type_def.get("seq", [])
         if not isinstance(seq, list):
             raise KsyUnsupported(f"type {path} has no supported seq")
@@ -1506,7 +1541,8 @@ def parse_ksy_structure(
         local_types = dict(effective_doc.get("__ksy_import_types__", {}))
         if isinstance(type_def.get("types"), dict):
             local_types.update(type_def.get("types", {}))
-        local_enums = dict(effective_doc.get("enums", {}))
+        local_enums = dict(parent_scope.enums if parent_scope is not None else {})
+        local_enums.update(effective_doc.get("enums", {}))
         if isinstance(type_def.get("enums"), dict):
             local_enums.update(type_def.get("enums", {}))
         scope = _KsyScope(
@@ -1829,11 +1865,22 @@ def parse_ksy_structure(
                 arg_exprs = [] if not arg_text else _split_inline(arg_text)
                 type_args = [_ksy_eval(arg, scope, cursor, index=repeat_index) for arg in arg_exprs]
 
+        qualified_doc = None
+        if isinstance(nested_type_name, str) and "::" in nested_type_name:
+            owner, child = nested_type_name.split("::", 1)
+            imported_root = scope.types.get(owner)
+            imported_doc = imported_root.get("__ksy_doc__") if isinstance(imported_root, dict) else None
+            imported_types = imported_doc.get("types", {}) if isinstance(imported_doc, dict) else {}
+            if isinstance(imported_types.get(child), dict):
+                nested_type_name = child
+                qualified_doc = imported_doc
+                scope.types[child] = imported_types[child]
+
         if isinstance(nested_type_name, str) and nested_type_name in scope.types:
             nested = scope.types[nested_type_name]
             if not isinstance(nested, dict):
                 raise KsyUnsupported(f"type {nested_type_name!r} is not a mapping")
-            nested_doc = nested.get("__ksy_doc__") if isinstance(nested.get("__ksy_doc__"), dict) else scope.doc
+            nested_doc = qualified_doc or (nested.get("__ksy_doc__") if isinstance(nested.get("__ksy_doc__"), dict) else scope.doc)
             child_end_limit = limit_end if size is None else cursor + size
             if child_end_limit > limit_end:
                 raise KsyError(f"bounded type {path} exceeds parent stream")
@@ -1862,7 +1909,8 @@ def parse_ksy_structure(
             if end > limit_end:
                 raise KsyError(f"truncated field {path}")
             value = data[cursor:end]
-            ann(cursor, end, path, label, depth, "payload" if semantic_kind == "instance" else semantic_kind)
+            ann(cursor, end, path, label, depth, "payload" if semantic_kind == "instance" else semantic_kind,
+                **size_evidence(field))
             validate_field(field, value, scope, end, path, cursor, end, repeat_index)
             values[path] = value
             return value, end
@@ -1871,8 +1919,19 @@ def parse_ksy_structure(
 
     root_def = dict(doc)
     root_def.setdefault("seq", doc.get("seq", []))
-    seq_end, root_scope = parse_type(root_def, offset, root, 1, None, offset, len(data))
-    flush_pending_instances()
+    try:
+        seq_end, root_scope = parse_type(root_def, offset, root, 1, None, offset, len(data))
+        flush_pending_instances()
+    except (KsyError, KsyUnsupported) as exc:
+        if not partial or not annotations:
+            raise
+        # Preserve proven prefix geometry when a later field is truncated or
+        # uses vocabulary this deliberately small projector cannot yet consume.
+        issues.append(str(exc))
+        seq_end = max(
+            offset,
+            max((row["end"] - base_offset for row in annotations), default=offset),
+        )
     max_end = seq_end
     if annotations:
         max_end = max(max_end, max(row["end"] - base_offset for row in annotations))
@@ -1892,6 +1951,8 @@ def parse_ksy_structure(
         "annotations": annotations,
         "values": values,
         "constraints": constraints,
+        "partial": bool(issues),
+        "issues": issues,
     }
 
 
@@ -2119,10 +2180,9 @@ def _auto_anchor_is_discriminating(magic: bytes) -> bool:
     discovery anchor makes blank media look richly structured, which is exactly
     backwards for Clarity.
 
-    Generic auto-discovery therefore requires at least five literal bytes and
-    rejects filler-dominated literals.  Shorter signatures can still be useful
-    once corroborated by format-specific evidence (MBR and ELF already do this),
-    or when a KSY is selected explicitly with --ksy.
+    Generic auto-discovery rejects filler-dominated literals. Short signatures
+    may nominate only at their exact statically derived position; the subsequent
+    parse and contradiction checks decide whether identity is justified.
     """
     if not isinstance(magic, bytes) or len(magic) < AUTO_KSY_MIN_ANCHOR:
         return False
@@ -2146,6 +2206,10 @@ def _auto_ksy_anchors(doc: dict) -> list[dict]:
 
     root_anchors, _ = _auto_seq_anchors(doc, doc.get("seq", []), 0, types, constants)
     for offset, magic in root_anchors:
+        out.append({"offset": offset, "bytes": magic, "root_instance": None})
+
+    ksy_id = str(doc.get("meta", {}).get("id") or "")
+    for offset, magic in _CORPUS_SCOUT_CLUES.get(ksy_id, []):
         out.append({"offset": offset, "bytes": magic, "root_instance": None})
 
     instances = doc.get("instances", {})
@@ -2225,8 +2289,8 @@ def auto_ksy_views(
     file contains a sufficiently discriminating literal at a mechanically
     derivable root-relative offset, that literal can nominate a candidate root.  The full supported KSY
     projector must still parse the candidate before any structural view is emitted.
-    Short or filler-like literals are intentionally excluded from this generic
-    path; those need additional evidence rather than cheap coincidence.
+    Filler-like literals are excluded. Short literals are position-bound and
+    require additional parsed structure rather than becoming identity by magic.
     """
     if not data or limit <= 0:
         return []
@@ -2236,6 +2300,11 @@ def auto_ksy_views(
     for relative in _iter_ksy_relatives():
         if len(out) >= limit:
             break
+        # MBR has deliberately stricter coherence checks below; its ubiquitous
+        # 55 aa trailer is also present on FAT boot sectors and must not enter
+        # the generic literal-only identity path.
+        if relative == MBR_KSY_RELATIVE:
+            continue
         path = resolve_ksy_path(relative)
         if path is None:
             continue
@@ -2273,7 +2342,18 @@ def auto_ksy_views(
             search_from = 0
             matches = 0
             while len(out) < limit:
-                match = data.find(magic, search_from)
+                # Two- and four-byte signatures may nominate an object only at
+                # their statically expected position.  Do not hunt arbitrary
+                # payloads for cheap short-magic coincidences.
+                if len(magic) < 5:
+                    # Common short clues are local corroborators: they can
+                    # nominate the supplied root, but are never scanned across
+                    # arbitrary payload bytes.
+                    match = anchor_offset if data[anchor_offset:anchor_offset + len(magic)] == magic else -1
+                else:
+                    # A distinctive global clue implies a candidate root in the
+                    # clue's own coordinate system, not at absolute offset zero.
+                    match = data.find(magic, search_from)
                 if match < 0:
                     break
                 search_from = match + 1
@@ -2296,6 +2376,7 @@ def auto_ksy_views(
                         base_offset=base_offset,
                         root_path=ksy_id,
                         root_instance_filter={root_instance} if root_instance else None,
+                        partial=True,
                     )
                 except Exception:
                     # A literal hit only nominates a candidate.  If this KSY's
@@ -2328,7 +2409,28 @@ def auto_ksy_views(
                 absolute_end = max(int(row.get("end", absolute_start)) for row in annotations)
                 failed = [row for row in constraints if not bool(row.get("passed"))]
                 passed = len(constraints) - len(failed)
-                strong = len(magic) >= 8 and not failed
+                passed_rows = [row for row in constraints if bool(row.get("passed"))]
+                evidence = {
+                    "anchor": 1,
+                    "secondary_literals": sum(
+                        row.get("kind") == "contents"
+                        and not (int(row.get("start", -1)) == base_offset + match
+                                 and int(row.get("end", -1)) == base_offset + match + len(magic))
+                        for row in passed_rows
+                    ),
+                    "valid_constraints": sum(row.get("kind") == "valid" for row in passed_rows),
+                    "computed_sizes": sum(
+                        isinstance(row.get("size_rule"), str) and row.get("size_rule") != "eos"
+                        for row in annotations
+                    ),
+                    "computed_offsets": sum(row.get("kind") == "instance" for row in annotations),
+                    "table_geometry": sum(
+                        row.get("kind") == "table" and int(row.get("count", 0)) > 0
+                        for row in annotations
+                    ),
+                }
+                independent = sum(bool(value) for key, value in evidence.items() if key != "anchor")
+                strong = not failed and root_local == 0 and independent >= 1
                 out.append({
                     "kind": "ksy_structure",
                     "ksy_id": ksy_id,
@@ -2343,10 +2445,15 @@ def auto_ksy_views(
                     "checks_total": len(constraints),
                     "hard_contradictions": [str(row.get("path", "constraint")) for row in failed],
                     "strong_identity": strong,
+                    "partial": bool(parsed.get("partial")),
+                    "issues": list(parsed.get("issues", [])),
+                    "evidence": evidence,
                     "annotations": annotations,
                     "constraints": constraints,
                 })
-                break
+                # Keep looking: one source range can contain several objects of
+                # the same format. seen_candidates merges secondary clues that
+                # imply an already-investigated (format, root) hypothesis.
     return out
 
 def _mbr_ksy() -> tuple[dict, Path] | None:
@@ -2496,6 +2603,11 @@ def mbr_views(
     first = (-base_offset) % extent
     stop = len(data) - extent
     for off in range(first, stop + 1, extent):
+        # The missing-signature partial case is meaningful at a caller-proposed
+        # root, not at every sector of a large arbitrary source. Avoid parsing
+        # hundreds of obviously ineligible sectors through the full KSY.
+        if off != first and data[off + 510:off + 512] != b"\x55\xaa":
+            continue
         view = mbr_view_at(data, off, base_offset)
         if view is not None:
             out.append(view)
@@ -2841,13 +2953,25 @@ def analysis_result(
     structure = structure_regions(data)
 
     views = mbr_views(data, base_offset, windowed=windowed)
-    if windowed:
-        views.extend(auto_ksy_views(data, base_offset, max(0, MAX_AUTO_KSY_VIEWS - len(views))))
+    views.extend(auto_ksy_views(data, base_offset, max(0, MAX_AUTO_KSY_VIEWS - len(views))))
     identity = [
         claim
         for view in views
         if (claim := mbr_identity_claim_from_view(view)) is not None
     ]
+    for view in views:
+        if view.get("kind") == "ksy_structure" and view.get("strong_identity"):
+            identity.append({
+                "kind": "ksy_identity",
+                "ksy_id": view["ksy_id"],
+                "offset": view["offset"],
+                "extent": view["extent"],
+                "shape_source": view["shape_source"],
+                "checks_passed": view["checks_passed"],
+                "checks_total": view["checks_total"],
+                "partial": view.get("partial", False),
+                "issues": view.get("issues", []),
+            })
     # ELF offsets are local to the supplied byte stream; translate them into the
     # same global coordinate space used by structural views.
     elf_claims = elf_identity_claims(data)
@@ -2934,6 +3058,18 @@ def print_structure(structure: dict) -> None:
 
 def print_views(views: list[dict]) -> None:
     for view in views:
+        if view["kind"] == "ksy_structure":
+            verdict = "recognized, partial" if view.get("partial") else "recognized"
+            print(f"View: {view['ksy_id']} structure at 0x{view['offset']:x} ({verdict})")
+            print(
+                f"  structural checks: {view['checks_passed']}/{view['checks_total']}  "
+                f"annotations: {len(view.get('annotations', []))}"
+            )
+            print(f"  shape source: {view['shape_source']}")
+            for issue in view.get("issues", [])[:1]:
+                print(f"  unresolved: {issue}")
+            print()
+            continue
         if view["kind"] != "mbr_partition_table":
             continue
         verdict = "strong" if view["strong_identity"] else "partial"
@@ -2995,6 +3131,12 @@ def print_analysis(
                     "  minimum structurally referenced extent: "
                     f"{claim['minimum_referenced_extent']} bytes"
                 )
+                print()
+            elif claim["kind"] == "ksy_identity":
+                suffix = " (partial)" if claim.get("partial") else ""
+                print(f"CLAIM: structurally validated {claim['ksy_id']} object{suffix}")
+                print(f"  offset: 0x{claim['offset']:x}  projected extent: {claim['extent']} bytes")
+                print(f"  shape source: {claim['shape_source']}")
                 print()
             elif claim["kind"] == "byte_coincidence_periodicity":
                 print("CLAIM: strong byte-coincidence periodicity")
