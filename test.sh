@@ -903,11 +903,8 @@ check_real_ksy test/george2.jpg jpeg
 check_real_ksy test/sample.wav wav
 check_real_ksy test/fat.img vfat
 check_real_ksy test/ext2.img ext2
-if [ -f test/cmd.exe ]; then
-    check_real_ksy test/cmd.exe microsoft_pe
-else
-    echo "PE acceptance BLOCKED: test/cmd.exe is not present" >&2
-fi
+[ -f test/cmd.exe ] || { echo "FAIL: missing acceptance specimen test/cmd.exe" >&2; exit 1; }
+check_real_ksy test/cmd.exe microsoft_pe
 
 # The real FAT and ext2 definitions currently prove useful structure before
 # reaching an out-of-line extent / malformed directory tail in these images.
@@ -922,6 +919,43 @@ views = [v for v in obj["views"] if v.get("strong_identity")]
 assert views and any(v.get("partial") and v.get("issues") for v in views), sys.argv[2]
 PY
 done
+
+# Preserve the global clue while disproving a predicted secondary literal. The
+# candidate remains inspectable as a partial structural hypothesis, but a hard
+# contradiction must withhold identity.
+cp test/sample.png "$tmp/png-near-miss"
+printf 'JUNK' | dd of="$tmp/png-near-miss" bs=1 seek=12 conv=notrunc status=none
+./clarity.py --analyze --json "$tmp/png-near-miss" > "$tmp/png-near-miss.json"
+python3 - "$tmp/png-near-miss.json" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+views = [v for v in obj["views"] if v.get("ksy_id") == "png"]
+assert views, "PNG signature should still nominate a visible candidate"
+assert not any(v.get("strong_identity") for v in views)
+assert any(v.get("hard_contradictions") for v in views)
+PY
+
+# PE's cheap MZ clue survives, but the root-relative PE signature predicted by
+# e_lfanew is contradicted. This specifically guards against MZ-only identity.
+cp test/cmd.exe "$tmp/pe-near-miss"
+python3 - "$tmp/pe-near-miss" <<'PY'
+import sys
+p = sys.argv[1]
+b = bytearray(open(p, "rb").read())
+ofs = int.from_bytes(b[0x3c:0x40], "little")
+assert b[ofs:ofs + 4] == b"PE\0\0"
+b[ofs:ofs + 4] = b"PX\0\0"
+open(p, "wb").write(b)
+PY
+./clarity.py --analyze --json "$tmp/pe-near-miss" > "$tmp/pe-near-miss.json"
+python3 - "$tmp/pe-near-miss.json" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+views = [v for v in obj["views"] if v.get("ksy_id") == "microsoft_pe"]
+assert views, "MZ should retain the PE candidate hypothesis"
+assert not any(v.get("strong_identity") for v in views)
+assert any(v.get("hard_contradictions") for v in views)
+PY
 
 # Strong anchors remain root-relative during structural scanning. Two complete
 # PNGs at nonzero offsets must yield two hypotheses, while common PK bytes in the

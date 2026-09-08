@@ -2428,7 +2428,6 @@ def auto_ksy_views(
                         row.get("kind") == "table" and int(row.get("count", 0)) > 0
                         for row in annotations
                     ),
-                    "typed_structure": sum(bool(row.get("type")) for row in annotations),
                 }
                 independent = sum(bool(value) for key, value in evidence.items() if key != "anchor")
                 strong = not failed and root_local == 0 and independent >= 1
