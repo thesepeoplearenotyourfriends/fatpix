@@ -32,6 +32,9 @@ _KSY_DOC_CACHE: dict[str, tuple[int, int, dict]] = {}
 # Some real corpus definitions express their identifying clue through enums or
 # field relationships rather than ``contents``. These are nomination clues only;
 # the KSY projection still has to corroborate them before a view is emitted.
+# Transitional hints for clues the static KSY walker cannot derive yet. Each
+# entry names the real corpus relationship that should eventually supersede it;
+# none bypasses parsing or contributes more than one evidence category.
 _CORPUS_SCOUT_CLUES = {
     "ext2": [(1080, b"\x53\xef")],       # ext2.super_block_struct.magic
     "jpeg": [(0, b"\xff\xd8")],          # segment magic + marker_enum::soi
@@ -1255,6 +1258,13 @@ def parse_ksy_structure(
         annotations.append(row)
         return row
 
+    def size_evidence(field: dict) -> dict:
+        if "size" in field:
+            return {"size_rule": field["size"]}
+        if field.get("size-eos") is True:
+            return {"size_rule": "eos"}
+        return {}
+
     def field_size(field: dict, scope: _KsyScope, cursor: int, index: int | None = None) -> int | None:
         if "size" in field:
             return _ksy_int(field["size"], scope, cursor, index=index)
@@ -1899,7 +1909,8 @@ def parse_ksy_structure(
             if end > limit_end:
                 raise KsyError(f"truncated field {path}")
             value = data[cursor:end]
-            ann(cursor, end, path, label, depth, "payload" if semantic_kind == "instance" else semantic_kind)
+            ann(cursor, end, path, label, depth, "payload" if semantic_kind == "instance" else semantic_kind,
+                **size_evidence(field))
             validate_field(field, value, scope, end, path, cursor, end, repeat_index)
             values[path] = value
             return value, end
@@ -2398,8 +2409,29 @@ def auto_ksy_views(
                 absolute_end = max(int(row.get("end", absolute_start)) for row in annotations)
                 failed = [row for row in constraints if not bool(row.get("passed"))]
                 passed = len(constraints) - len(failed)
-                field_rows = [row for row in annotations if int(row.get("depth", 0)) > 0]
-                strong = not failed and len(field_rows) >= 3 and root_local == 0
+                passed_rows = [row for row in constraints if bool(row.get("passed"))]
+                evidence = {
+                    "anchor": 1,
+                    "secondary_literals": sum(
+                        row.get("kind") == "contents"
+                        and not (int(row.get("start", -1)) == base_offset + match
+                                 and int(row.get("end", -1)) == base_offset + match + len(magic))
+                        for row in passed_rows
+                    ),
+                    "valid_constraints": sum(row.get("kind") == "valid" for row in passed_rows),
+                    "computed_sizes": sum(
+                        isinstance(row.get("size_rule"), str) and row.get("size_rule") != "eos"
+                        for row in annotations
+                    ),
+                    "computed_offsets": sum(row.get("kind") == "instance" for row in annotations),
+                    "table_geometry": sum(
+                        row.get("kind") == "table" and int(row.get("count", 0)) > 0
+                        for row in annotations
+                    ),
+                    "typed_structure": sum(bool(row.get("type")) for row in annotations),
+                }
+                independent = sum(bool(value) for key, value in evidence.items() if key != "anchor")
+                strong = not failed and root_local == 0 and independent >= 1
                 out.append({
                     "kind": "ksy_structure",
                     "ksy_id": ksy_id,
@@ -2416,6 +2448,7 @@ def auto_ksy_views(
                     "strong_identity": strong,
                     "partial": bool(parsed.get("partial")),
                     "issues": list(parsed.get("issues", [])),
+                    "evidence": evidence,
                     "annotations": annotations,
                     "constraints": constraints,
                 })

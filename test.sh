@@ -876,9 +876,14 @@ import json, sys
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 expected, specimen = sys.argv[2:]
 views = obj.get("views", [])
-if not any(v.get("ksy_id") == expected and v.get("strong_identity") for v in views):
+matches = [v for v in views if v.get("ksy_id") == expected and v.get("strong_identity")]
+if not matches:
     detail = [(v.get("ksy_id", v.get("kind")), v.get("issues", [])[:1]) for v in views]
     raise SystemExit(f"FAIL: {specimen} did not earn {expected} identity; views={detail}")
+for view in matches:
+    evidence = view.get("evidence", {})
+    assert evidence.get("anchor") == 1
+    assert any(value for key, value in evidence.items() if key != "anchor"), evidence
 PY
 }
 
@@ -898,6 +903,11 @@ check_real_ksy test/george2.jpg jpeg
 check_real_ksy test/sample.wav wav
 check_real_ksy test/fat.img vfat
 check_real_ksy test/ext2.img ext2
+if [ -f test/cmd.exe ]; then
+    check_real_ksy test/cmd.exe microsoft_pe
+else
+    echo "PE acceptance BLOCKED: test/cmd.exe is not present" >&2
+fi
 
 # The real FAT and ext2 definitions currently prove useful structure before
 # reaching an out-of-line extent / malformed directory tail in these images.

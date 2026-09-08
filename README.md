@@ -18,6 +18,8 @@ binary analyzer, and Garble provides reversible transformations.
   coverage.
 - Added real FAT, ext2, JPEG, and WAV acceptance, retaining explicit unresolved
   reasons for partial filesystem projections.
+- Replaced annotation-count identity promotion with categorized structural
+  evidence accounting; added anonymous PE acceptance when `test/cmd.exe` is present.
 
 ### 2026-09-08
 
