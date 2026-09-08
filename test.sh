@@ -894,6 +894,24 @@ check_real_ksy test/sample.avi avi
 check_real_ksy test/sample.mp3 id3v2_3
 # This specimen's suffix is misleading; its bytes are an ordinary gzip stream.
 check_real_ksy test/george.jpg gzip
+check_real_ksy test/george2.jpg jpeg
+check_real_ksy test/sample.wav wav
+check_real_ksy test/fat.img vfat
+check_real_ksy test/ext2.img ext2
+
+# The real FAT and ext2 definitions currently prove useful structure before
+# reaching an out-of-line extent / malformed directory tail in these images.
+# Keep those concrete unresolved KSY relationships visible rather than silently
+# treating a prefix parse as complete.
+for specimen in test/fat.img test/ext2.img; do
+    ./clarity.py --analyze --json "$specimen" > "$tmp/partial-real-ksy.json"
+    python3 - "$tmp/partial-real-ksy.json" "$specimen" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+views = [v for v in obj["views"] if v.get("strong_identity")]
+assert views and any(v.get("partial") and v.get("issues") for v in views), sys.argv[2]
+PY
+done
 
 # Strong anchors remain root-relative during structural scanning. Two complete
 # PNGs at nonzero offsets must yield two hypotheses, while common PK bytes in the

@@ -16,6 +16,8 @@ binary analyzer, and Garble provides reversible transformations.
   keeping short clues local to an existing candidate root.
 - Added real AVI and ID3/MP3 acceptance and root-relative multi-object scanning
   coverage.
+- Added real FAT, ext2, JPEG, and WAV acceptance, retaining explicit unresolved
+  reasons for partial filesystem projections.
 
 ### 2026-09-08
 

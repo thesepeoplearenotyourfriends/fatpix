@@ -29,6 +29,16 @@ AUTO_KSY_MIN_ANCHOR = 2
 _KSY_ROOT_OVERRIDE: Path | None = None
 _KSY_DOC_CACHE: dict[str, tuple[int, int, dict]] = {}
 
+# Some real corpus definitions express their identifying clue through enums or
+# field relationships rather than ``contents``. These are nomination clues only;
+# the KSY projection still has to corroborate them before a view is emitted.
+_CORPUS_SCOUT_CLUES = {
+    "ext2": [(1080, b"\x53\xef")],       # ext2.super_block_struct.magic
+    "jpeg": [(0, b"\xff\xd8")],          # segment magic + marker_enum::soi
+    "vfat": [(82, b"FAT32   ")],          # FAT32 EBPB filesystem type label
+    "wav": [(8, b"WAVE")],                # WAV RIFF fourcc::wave form type
+}
+
 BYTE_NAMES = {
     0x00: "NUL",
     0x09: "TAB",
@@ -411,6 +421,18 @@ def _split_mapping_pair(text: str) -> tuple[str, str]:
 
 def _yaml_scalar(text: str):
     text = text.strip()
+    # Real KSY enum members and empty inline mappings commonly carry YAML
+    # comments (jpeg marker_enum and riff.slot are acceptance blockers).
+    quote = None
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote and (i == 0 or text[i - 1] != "\\"):
+                quote = None
+        elif ch in {"'", '"'}:
+            quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1].isspace()):
+            text = text[:i].rstrip()
+            break
     if not text:
         return None
     low = text.lower()
@@ -1509,7 +1531,8 @@ def parse_ksy_structure(
         local_types = dict(effective_doc.get("__ksy_import_types__", {}))
         if isinstance(type_def.get("types"), dict):
             local_types.update(type_def.get("types", {}))
-        local_enums = dict(effective_doc.get("enums", {}))
+        local_enums = dict(parent_scope.enums if parent_scope is not None else {})
+        local_enums.update(effective_doc.get("enums", {}))
         if isinstance(type_def.get("enums"), dict):
             local_enums.update(type_def.get("enums", {}))
         scope = _KsyScope(
@@ -1832,11 +1855,22 @@ def parse_ksy_structure(
                 arg_exprs = [] if not arg_text else _split_inline(arg_text)
                 type_args = [_ksy_eval(arg, scope, cursor, index=repeat_index) for arg in arg_exprs]
 
+        qualified_doc = None
+        if isinstance(nested_type_name, str) and "::" in nested_type_name:
+            owner, child = nested_type_name.split("::", 1)
+            imported_root = scope.types.get(owner)
+            imported_doc = imported_root.get("__ksy_doc__") if isinstance(imported_root, dict) else None
+            imported_types = imported_doc.get("types", {}) if isinstance(imported_doc, dict) else {}
+            if isinstance(imported_types.get(child), dict):
+                nested_type_name = child
+                qualified_doc = imported_doc
+                scope.types[child] = imported_types[child]
+
         if isinstance(nested_type_name, str) and nested_type_name in scope.types:
             nested = scope.types[nested_type_name]
             if not isinstance(nested, dict):
                 raise KsyUnsupported(f"type {nested_type_name!r} is not a mapping")
-            nested_doc = nested.get("__ksy_doc__") if isinstance(nested.get("__ksy_doc__"), dict) else scope.doc
+            nested_doc = qualified_doc or (nested.get("__ksy_doc__") if isinstance(nested.get("__ksy_doc__"), dict) else scope.doc)
             child_end_limit = limit_end if size is None else cursor + size
             if child_end_limit > limit_end:
                 raise KsyError(f"bounded type {path} exceeds parent stream")
@@ -2161,6 +2195,10 @@ def _auto_ksy_anchors(doc: dict) -> list[dict]:
 
     root_anchors, _ = _auto_seq_anchors(doc, doc.get("seq", []), 0, types, constants)
     for offset, magic in root_anchors:
+        out.append({"offset": offset, "bytes": magic, "root_instance": None})
+
+    ksy_id = str(doc.get("meta", {}).get("id") or "")
+    for offset, magic in _CORPUS_SCOUT_CLUES.get(ksy_id, []):
         out.append({"offset": offset, "bytes": magic, "root_instance": None})
 
     instances = doc.get("instances", {})
