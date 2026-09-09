@@ -402,6 +402,7 @@ static void mouse_event(Display *d,View *v,const Source *s,const uint8_t packet[
     static int old_left; int left=packet[0]&1,cols=d->var.xres/v->cell,rows=((int)d->var.yres-22)/v->cell;
     int64_t dx=(int8_t)packet[1],dy=(int8_t)packet[2]; size_t index; uint64_t a,b;
     d->mouse_x+=(int)dx;d->mouse_y-=(int)dy;
+    if(!left)v->selecting=0;
     if(d->mouse_x<0)d->mouse_x=0;
     if(d->mouse_x>=(int)d->var.xres)d->mouse_x=(int)d->var.xres-1;
     if(d->mouse_y<0)d->mouse_y=0;
@@ -412,7 +413,6 @@ static void mouse_event(Display *d,View *v,const Source *s,const uint8_t packet[
     if(a>=s->size){old_left=left;return;}b=a+v->scale;if(b<a||b>s->size)b=s->size;
     if(left&&!old_left){v->selection_anchor=a;v->selection_start=a;v->selection_end=b;v->cursor=a;v->selecting=1;}
     else if(left&&v->selecting){uint64_t anchor_end=v->selection_anchor+v->scale;if(anchor_end<v->selection_anchor||anchor_end>s->size)anchor_end=s->size;v->selection_start=a<v->selection_anchor?a:v->selection_anchor;v->selection_end=b>anchor_end?b:anchor_end;v->cursor=a;}
-    if(!left)v->selecting=0;
     old_left=left;
 }
 

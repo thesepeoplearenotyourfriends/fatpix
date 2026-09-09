@@ -343,6 +343,10 @@ int main(void) {
     view.cursor++; view.selection_start = 128; view.selection_end = 130;
     display.mouse_x++; display.mouse_y++;
     result = render(&display, &source, &view, &cache, 0);
+    view.selecting = 1;
+    display.mouse_y = display.var.yres - 1;
+    mouse_event(&display, &view, &source, (const uint8_t[]){8, 0, 0});
+    if (view.selecting) return 5;
     free(cache.cells); free(display.map); free(display.back);
     return result < 0 ? 4 : 0;
 }

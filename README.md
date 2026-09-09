@@ -30,6 +30,7 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Ended native mouse drags when the button is released outside the data grid.
 - Cached the native FatPix logical grid and inspector bytes so pointer,
   selection, and in-viewport cursor redraws do not reread the file viewport.
 - Added the native FatPix hex inspector and direct mouse selection, including
