@@ -39,7 +39,7 @@ These tools are intended to stay small, local, understandable, and useful on ord
 
 ## Direction
 
-Python is the current implementation language because it is fast to iterate on and well suited to prototyping parsers and analysis logic. It should be treated as a likely staging language for a later, smaller C implementation where that makes sense.
+Python is the current testing implementation language because it is fast to iterate on and well suited to prototyping parsers and analysis logic. It should be treated as a staging language for the C implementation.
 
 Do not introduce Rust, GUI frameworks, large runtimes, package ecosystems, or architectural layers without a compelling project-specific reason.
 
@@ -180,6 +180,10 @@ Codex owns validation. Before opening or updating a PR, run the relevant tests y
 ## On scope: 
 
 When changing the KSY interpreter itself, tie the change to a specific construct encountered in a real /kaitai definition or a demonstrated parser defect; do not broaden the parser speculatively.
+
+## Coding style: 
+
+Do not minify or collapse source formatting. Use conventional human-readable C formatting, one logical statement per line, with normal indentation and braces. Keep lines reasonably bounded (~100–120 columns). When modifying an already-compressed function, expand the touched function into readable formatting rather than extending the compressed style. Formatting-only changes must not alter behavior.
 
 ## Changelog maintenance:
 
