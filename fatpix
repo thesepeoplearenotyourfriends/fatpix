@@ -2666,12 +2666,50 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         metavar="PATH",
         help="optional clarity.py used by the C semantic-view key; auto-detects ./clarity.py or a sibling",
     )
+    parser.add_argument(
+        "--dump-grid",
+        metavar="WIDTHxHEIGHT",
+        help="print deterministic literal-cell classifications instead of opening the UI",
+    )
+    parser.add_argument("--scale", default="1", help=argparse.SUPPRESS)
+    parser.add_argument("--offset", default="0", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.clarity:
         path = os.path.abspath(os.path.expanduser(args.clarity))
         if not os.path.isfile(path):
             parser.error(f"--clarity script not found: PR:[{path}]")
     return args
+
+
+def dump_logical_grid(source: ByteSource, dimensions: str, scale_text: str,
+                      offset_text: str) -> None:
+    """Emit the portable literal-lens representation used for C/Python parity."""
+    match = re.fullmatch(r"([1-9][0-9]*)x([1-9][0-9]*)", dimensions)
+    if match is None:
+        raise ValueError("grid size must be WIDTHxHEIGHT")
+    width, height = map(int, match.groups())
+    if width > 10000 or height > 10000:
+        raise ValueError("grid dimensions are too large")
+    scale = parse_scale(scale_text)
+    offset = parse_offset(offset_text)
+    if scale < 1 or offset < 0:
+        raise ValueError("scale must be positive and offset non-negative")
+    for y in range(height):
+        row = []
+        for x in range(width):
+            start = offset + (y * width + x) * scale
+            span = min(scale, max(0, source.size - start))
+            sample = source.sample(start, span)
+            if span <= 0:
+                color, kind = 8, "eof"
+            elif not sample:
+                color, kind = 8, "unreadable"
+            elif span == 1:
+                color, kind = FatPix._byte_color(sample[0])
+            else:
+                color, kind = FatPix._summary_color(FatPix._metrics(sample))
+            row.append(f"{color}:{kind}")
+        print(" ".join(row))
 
 
 _FILE_ZOOM_KEYS = frozenset({"-", "=", "_", "+", "\r", "\n"})
@@ -2699,6 +2737,15 @@ def handle_key_batch(app: FatPix, term: RawTerminal, key) -> bool:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if args.dump_grid is not None:
+        if args.file in (None, "-"):
+            raise RuntimeError("--dump-grid needs --file PATH")
+        source = ByteSource(path=args.file)
+        try:
+            dump_logical_grid(source, args.dump_grid, args.scale, args.offset)
+        finally:
+            source.close()
+        return 0
     clarity_path = resolve_clarity_path(args.clarity)
     piped_input = not sys.stdin.isatty()
     keyboard_fd = sys.stdin.fileno() if not piped_input else -1
