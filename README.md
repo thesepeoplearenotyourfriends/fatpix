@@ -32,6 +32,8 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Reformatted the native viewer into conventionally indented, bounded C source
+  without changing its behavior.
 - Unified native viewport classification and lens sampling into one bounded
   batch/coarse-read path, cached recolored grids across presentation redraws,
   and fixed half-page, drag-focus, dump-safety, and overlay mouse semantics.
