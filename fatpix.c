@@ -30,7 +30,7 @@
 #define MOUSE_SPEED_DEFAULT 1.0
 #define FONT_SCALE_DEFAULT 2
 
-typedef struct { int fd; uint64_t size; const char *path; } Source;
+typedef struct { int fd; uint64_t size, read_calls; const char *path; } Source;
 typedef struct { uint8_t color; const char *kind; } Cell;
 typedef struct {
     int fd, tty, kd_mode, raw, mapped;
@@ -62,7 +62,9 @@ typedef struct {
     uint16_t *sample_n, *context_n;
     uint64_t baseline_start, baseline_scale;
     size_t baseline_n;
-    int baseline_valid;
+    int baseline_valid, colored_lens;
+    uint64_t colored_cursor;
+    uint64_t recolor_count;
 } RenderCache;
 
 static const char *lens_names[] = {"", "literal", "xor-prev", "delta-prev", "compress", "neighbor-diff", "cursor-sim"};
@@ -205,6 +207,7 @@ static int source_open(Source *s, const char *path) {
 
 static ssize_t source_read(const Source *s, void *buf, size_t count, uint64_t off) {
     size_t done = 0;
+    ((Source *)s)->read_calls++;
     if (off >= s->size) return 0;
     if ((uint64_t)count > s->size - off) count = (size_t)(s->size - off);
     while (done < count) {
@@ -242,35 +245,29 @@ static Cell summary_cell(const uint8_t *p, size_t n) {
     return (Cell){2,"high-H"};
 }
 
-/* Fine viewports get one contiguous pread. Coarse viewports get at most one
- * centered 1 KiB representative read per cell. */
-static int make_grid(const Source *s, uint64_t start, uint64_t scale,
-                     size_t count, Cell *cells) {
-    uint8_t *batch = NULL, sample[SAMPLE_MAX]; size_t batch_n = 0, i;
-    uint64_t total;
-    if (!scale || count > UINT64_MAX/scale) { errno=EOVERFLOW; return -1; }
-    total = scale * count;
-    if (total <= BATCH_MAX && start < s->size) {
-        uint64_t avail=s->size-start; batch_n=(size_t)(avail<total?avail:total);
-        batch=malloc(batch_n ? batch_n : 1);
-        if (!batch || source_read(s,batch,batch_n,start)!=(ssize_t)batch_n) { free(batch); return -1; }
+/* Match Python's viewport loader: one contiguous read (including previous
+ * byte and short-cell context) for bounded views, or one representative read
+ * per cell when the viewport would exceed BATCH_MAX. */
+static int make_grid_data(const Source *s,uint64_t start,uint64_t scale,size_t count,
+                          Cell *cells,uint8_t *samples,uint8_t *contexts,uint8_t *previous,
+                          uint16_t *sample_n,uint16_t *context_n) {
+    uint8_t *batch=NULL,local[SAMPLE_MAX+1];size_t batch_n=0,i;uint64_t total,batch_start=0;
+    if(!scale||count>UINT64_MAX/scale){errno=EOVERFLOW;return -1;}total=scale*count;
+    if(total<=BATCH_MAX&&start<s->size){uint64_t extra,want,avail;batch_start=start?start-1:start;extra=start-batch_start+256;want=total>UINT64_MAX-extra?UINT64_MAX:total+extra;avail=s->size-batch_start;if(want>avail)want=avail;batch_n=(size_t)want;batch=malloc(batch_n?batch_n:1);if(!batch||source_read(s,batch,batch_n,batch_start)!=(ssize_t)batch_n){free(batch);return -1;}}
+    for(i=0;i<count;i++){uint64_t off,span,sample_start;size_t n=0,cn=0;uint8_t prev=0,*dst=samples?samples+i*SAMPLE_MAX:local;
+        if(i>(UINT64_MAX-start)/scale)off=UINT64_MAX;else off=start+(uint64_t)i*scale;
+        if(off<s->size){span=s->size-off;if(span>scale)span=scale;n=(size_t)(span>SAMPLE_MAX?SAMPLE_MAX:span);sample_start=span>SAMPLE_MAX?off+(span-n)/2:off;
+            if(batch){size_t rel=(size_t)(sample_start-batch_start);memcpy(dst,batch+rel,n);if(sample_start>batch_start)prev=batch[rel-1];if(span<256){cn=(size_t)((s->size-off)<256?s->size-off:256);if(contexts)memcpy(contexts+i*SAMPLE_MAX,batch+(size_t)(off-batch_start),cn);}else{cn=n;if(contexts)memcpy(contexts+i*SAMPLE_MAX,dst,n);}}
+            else {uint64_t read_start=sample_start?sample_start-1:sample_start;size_t want=n+(sample_start?1:0);ssize_t got=source_read(s,local,want,read_start);if(got<0){free(batch);return -1;}if(sample_start){prev=got?local[0]:0;n=got>0?(size_t)got-1:0;if(samples)memcpy(dst,local+1,n);else memmove(local,local+1,n);}else n=(size_t)got;cn=n;if(contexts)memcpy(contexts+i*SAMPLE_MAX,dst,n);}
+            cells[i]=span==1&&n?byte_cell(dst[0]):summary_cell(dst,n);
+        }else cells[i]=(Cell){8,"eof"};
+        if(previous)previous[i]=prev;
+        if(sample_n)sample_n[i]=(uint16_t)n;
+        if(context_n)context_n[i]=(uint16_t)cn;
     }
-    for (i=0;i<count;i++) {
-        uint64_t off, span; size_t n;
-        if (i > (UINT64_MAX-start)/scale) off=UINT64_MAX; else off=start+i*scale;
-        if (off >= s->size) { cells[i]=(Cell){8,"eof"}; continue; }
-        span=s->size-off; if(span>scale) span=scale;
-        n=(size_t)(span>SAMPLE_MAX?SAMPLE_MAX:span);
-        if (batch) memcpy(sample,batch+(size_t)(off-start)+(size_t)(span-n)/2,n);
-        else {
-            uint64_t at=off+(span-n)/2;
-            ssize_t got=source_read(s,sample,n,at);
-            if(got<0) { free(batch); return -1; } n=(size_t)got;
-        }
-        cells[i] = span==1 && n ? byte_cell(sample[0]) : summary_cell(sample,n);
-    }
-    free(batch); return 0;
+    free(batch);return 0;
 }
+static int make_grid(const Source*s,uint64_t start,uint64_t scale,size_t count,Cell*cells){return make_grid_data(s,start,scale,count,cells,NULL,NULL,NULL,NULL,NULL);}
 
 static uint8_t scalar_color(double v) {
     if(v<=.005)return 0;
@@ -314,20 +311,11 @@ static Cell classify_lens(int lens,const uint8_t *p,size_t n,uint8_t previous,
     return summary_cell(p,n);
 }
 
-static int load_samples(const Source *s,const View *v,RenderCache *c) {
-    size_t i,count=c->count;uint8_t previous=0;
-    uint8_t *samples=realloc(c->samples,count*SAMPLE_MAX),*contexts,*prev;
-    uint16_t *sizes,*context_sizes;if(!samples)return -1;c->samples=samples;
-    contexts=realloc(c->contexts,count*SAMPLE_MAX);if(!contexts)return -1;c->contexts=contexts;
-    prev=realloc(c->previous,count);if(!prev)return -1;c->previous=prev;
-    sizes=realloc(c->sample_n,count*sizeof(*sizes));if(!sizes)return -1;c->sample_n=sizes;
-    context_sizes=realloc(c->context_n,count*sizeof(*context_sizes));if(!context_sizes)return -1;c->context_n=context_sizes;
-    for(i=0;i<count;i++){uint64_t off=v->view+(uint64_t)i*v->scale,span,at;size_t n,cn;if(off>=s->size){sizes[i]=context_sizes[i]=0;continue;}span=s->size-off;if(span>v->scale)span=v->scale;n=(size_t)(span>SAMPLE_MAX?SAMPLE_MAX:span);at=off+(span-n)/2;if(at&&source_read(s,&previous,1,at-1)!=1)return -1;else if(!at)previous=0;prev[i]=previous;if(source_read(s,samples+i*SAMPLE_MAX,n,at)!=(ssize_t)n)return -1;sizes[i]=(uint16_t)n;cn=span<256?(size_t)((s->size-off)<256?s->size-off:256):n;if(span<256){if(source_read(s,contexts+i*SAMPLE_MAX,cn,off)!=(ssize_t)cn)return -1;}else memcpy(contexts+i*SAMPLE_MAX,samples+i*SAMPLE_MAX,cn);context_sizes[i]=(uint16_t)cn;}
-    return 0;
-}
+
 static void recolor_grid(const View *v,RenderCache *c) {
     size_t i,cursor_i=0;if(v->cursor>=v->view)cursor_i=(size_t)((v->cursor-v->view)/v->scale);if(cursor_i>=c->count)cursor_i=0;
     for(i=0;i<c->count;i++){const uint8_t*p=v->lens==4?c->contexts+i*SAMPLE_MAX:c->samples+i*SAMPLE_MAX;size_t n=v->lens==4?c->context_n[i]:c->sample_n[i];c->cells[i]=classify_lens(v->lens,p,n,c->previous[i],i?c->samples+(i-1)*SAMPLE_MAX:NULL,i?c->sample_n[i-1]:0,c->samples+cursor_i*SAMPLE_MAX,c->sample_n[cursor_i]);}
+    c->recolor_count++;
 }
 
 static int parse_u64(const char *text, int fractional, uint64_t *out) {
@@ -466,15 +454,20 @@ static int render(Display *d,const Source *s,const View *v,RenderCache *cache,in
     if(cols<1||rows<1)return -1;
     count=(size_t)cols*rows;
     if(grid_dirty||!cache->valid||cache->view!=view||cache->scale!=scale||cache->cols!=cols||cache->rows!=rows) {
-        Cell *replacement=realloc(cache->cells,count*sizeof(*replacement)),*literal;if(!replacement)return -1;
+        Cell *replacement=realloc(cache->cells,count*sizeof(*replacement)),*literal;uint8_t *bytes;uint16_t *sizes;if(!replacement)return -1;
         cache->cells=replacement;
         literal=realloc(cache->literal_cells,count*sizeof(*literal));if(!literal)return -1;cache->literal_cells=literal;
-        if(make_grid(s,view,scale,count,cache->cells)<0)return -1;
+        bytes=realloc(cache->samples,count*SAMPLE_MAX);if(!bytes)return -1;cache->samples=bytes;
+        bytes=realloc(cache->contexts,count*SAMPLE_MAX);if(!bytes)return -1;cache->contexts=bytes;
+        bytes=realloc(cache->previous,count);if(!bytes)return -1;cache->previous=bytes;
+        sizes=realloc(cache->sample_n,count*sizeof(*sizes));if(!sizes)return -1;cache->sample_n=sizes;
+        sizes=realloc(cache->context_n,count*sizeof(*sizes));if(!sizes)return -1;cache->context_n=sizes;
+        if(make_grid_data(s,view,scale,count,cache->cells,cache->samples,cache->contexts,cache->previous,cache->sample_n,cache->context_n)<0)return -1;
         memcpy(cache->literal_cells,cache->cells,count*sizeof(*cache->cells));
         cache->count=count;cache->view=view;cache->scale=scale;cache->cols=cols;cache->rows=rows;cache->valid=1;
-        if(load_samples(s,v,cache)<0)return -1;
+        cache->colored_lens=0;
     }
-    memcpy(cache->cells,cache->literal_cells,count*sizeof(*cache->cells));if(v->lens!=1)recolor_grid(v,cache);
+    if(cache->colored_lens!=v->lens||(v->lens==6&&cache->colored_cursor!=v->cursor)){memcpy(cache->cells,cache->literal_cells,count*sizeof(*cache->cells));if(v->lens!=1)recolor_grid(v,cache);cache->colored_lens=v->lens;cache->colored_cursor=v->cursor;}
     grid=cache->cells;memset(d->back,0,d->map_len);
     for(y=0;y<rows;y++)for(x=0;x<cols;x++){size_t i=(size_t)y*cols+x;uint64_t a=view+(uint64_t)i*scale,b=a+scale;rect(d,x*cell+1,y*cell+1,cell-2,cell-2,palette[grid[i].color]);if(v->selection_end>v->selection_start&&a<v->selection_end&&b>v->selection_start)outline(d,x*cell,y*cell,cell,0xef3e36);}
     if(cursor>=view && (cursor-view)/scale<count) { size_t i=(size_t)((cursor-view)/scale); x=(int)(i%cols)*cell;y=(int)(i/cols)*cell;outline(d,x,y,cell,0xffffff); }
@@ -520,6 +513,8 @@ static void center_view(View *v,uint64_t source_size,uint64_t cells) {
     uint64_t start=v->cursor>half?v->cursor-half:0,max_start=source_size>page?source_size-page:0;
     start=(start/v->scale)*v->scale;max_start=(max_start/v->scale)*v->scale;v->view=start>max_start?max_start:start;
 }
+static uint64_t representative_start(uint64_t start,uint64_t span){return span>1024?start+(span-1024)/2:start;}
+static uint64_t half_page_bytes(uint64_t cells,uint64_t scale){uint64_t half=cells/2;return half>UINT64_MAX/scale?UINT64_MAX:half*scale;}
 static void capture_baseline(const View*v,RenderCache*c){if(v->inspect&&c->inspect_valid){memcpy(c->baseline_data,c->inspect_data,c->inspect_n);c->baseline_n=c->inspect_n;c->baseline_start=c->inspect_start;c->baseline_scale=v->scale;}}
 static int mouse_event(Display *d,View *v,const Source *s,RenderCache *cache,const uint8_t packet[3]) {
     uint64_t old_cursor=v->cursor;
@@ -540,9 +535,9 @@ static int mouse_event(Display *d,View *v,const Source *s,RenderCache *cache,con
     if(index>UINT64_MAX/v->scale){old_left=left;return 0;}a=v->view+(uint64_t)index*v->scale;
     if(a>=s->size){old_left=left;return 0;}b=a+v->scale;if(b<a||b>s->size)b=s->size;
     if(left&&v->inspect&&a!=old_cursor)capture_baseline(v,cache);
-    if(left&&!old_left){v->selection_anchor=a;v->selection_start=a;v->selection_end=b;v->cursor=a;if(v->inspect)v->inspect_focus=b-a>1024?a+(b-a-1024)/2:a;v->selecting=1;}
+    if(left&&!old_left){v->selection_anchor=a;v->selection_start=a;v->selection_end=b;v->cursor=a;if(v->inspect)v->inspect_focus=representative_start(a,b-a);v->selecting=1;}
     else if(left&&v->selecting){uint64_t anchor_end=v->selection_anchor+v->scale;if(anchor_end<v->selection_anchor||anchor_end>s->size)anchor_end=s->size;v->selection_start=a<v->selection_anchor?a:v->selection_anchor;v->selection_end=b>anchor_end?b:anchor_end;v->cursor=a;}
-    old_left=left;if(v->cursor!=old_cursor)cache->inspect_valid=0;return v->cursor!=old_cursor;
+    old_left=left;if(v->cursor!=old_cursor){if(v->inspect)v->inspect_focus=representative_start(a,b-a);cache->inspect_valid=0;}return v->cursor!=old_cursor;
 }
 
 static const uint64_t small_scales[]={1,2,3,4,6,8,10,12,16,24,32,48,64,96,128,192,256,384,512,768};
@@ -555,16 +550,18 @@ static uint64_t zoom_scale(uint64_t old,int inward,int steps){uint64_t ladder[14
     while(--steps>0&&pos+1<n)pos++;
     return pos<n?ladder[pos]:old;
 }
-static int dump_selection(const Source*s,const View*v,const char*name){uint8_t buf[1024*1024];uint64_t at=v->selection_start,left=v->selection_end-v->selection_start;int fd;
-    if(!left){errno=EINVAL;return -1;}fd=open(name,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0666);if(fd<0)return -1;while(left){size_t want=left>sizeof(buf)?sizeof(buf):(size_t)left;ssize_t n=source_read(s,buf,want,at);if(n<=0||write(fd,buf,(size_t)n)!=n){close(fd);return -1;}at+=(uint64_t)n;left-=(uint64_t)n;}return close(fd);}
+static int dump_selection(const Source*s,const View*v,const char*name){uint8_t buf[1024*1024];uint64_t at=v->selection_start,left=v->selection_end-v->selection_start;int fd;struct stat source_stat,dest_stat;
+    if(!left){errno=EINVAL;return -1;}if(fstat(s->fd,&source_stat)==0&&stat(name,&dest_stat)==0&&source_stat.st_dev==dest_stat.st_dev&&source_stat.st_ino==dest_stat.st_ino){errno=EINVAL;return -1;}fd=open(name,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0666);if(fd<0)return -1;while(left){size_t want=left>sizeof(buf)?sizeof(buf):(size_t)left;ssize_t n=source_read(s,buf,want,at);if(n<=0||write(fd,buf,(size_t)n)!=n){close(fd);return -1;}at+=(uint64_t)n;left-=(uint64_t)n;}return close(fd);}
 static int lens_number(const char*t){int found=0,i;if(t[0]>='1'&&t[0]<='6'&&!t[1])return t[0]-'0';for(i=1;i<=6;i++)if(!strncmp(lens_names[i],t,strlen(t))){if(found)return 0;found=i;}return found;}
 static int run_file_command(const Source*s,View*v,char*cmd){char *arg,*op=cmd;uint64_t value;int lens;while(*op==' ')op++;arg=strchr(op,' ');if(arg){*arg++=0;while(*arg==' ')arg++;}
     {char*q;for(q=op;*q;q++)*q=(char)tolower((unsigned char)*q);if(!strcmp(op,"view")&&arg)for(q=arg;*q;q++)*q=(char)tolower((unsigned char)*q);}
     if((!strcmp(op,"g")||!strcmp(op,"goto"))&&arg&&parse_u64(arg,0,&value)==0&&value<s->size){v->cursor=value;v->inspect_focus=value;snprintf(v->message,sizeof(v->message),"goto 0x%llx",(unsigned long long)value);return 2;}
     if((!strcmp(op,"s")||!strcmp(op,"scale"))&&arg&&parse_u64(arg,1,&value)==0&&value){if(v->inspect&&v->inspect_focus<s->size)v->cursor=v->inspect_focus;v->scale=value;snprintf(v->message,sizeof(v->message),"scale %lluB/cell",(unsigned long long)value);return 2;}
     if(!strcmp(op,"view")&&arg&&(lens=lens_number(arg))){v->lens=lens;snprintf(v->message,sizeof(v->message),"view %d: %s",lens,lens_names[lens]);return 1;}
-    if(!strcmp(op,"dump")&&arg){if(!strcmp(arg,s->path)){snprintf(v->message,sizeof(v->message),"command error: refusing to overwrite source");return 0;}if(dump_selection(s,v,arg)<0)snprintf(v->message,sizeof(v->message),"command error: %s",strerror(errno));else snprintf(v->message,sizeof(v->message),"dumped selection");return 0;}
+    if(!strcmp(op,"dump")&&arg){if(dump_selection(s,v,arg)<0)snprintf(v->message,sizeof(v->message),"command error: %s",strerror(errno));else snprintf(v->message,sizeof(v->message),"dumped selection");return 0;}
     snprintf(v->message,sizeof(v->message),"command error: invalid command or argument");return 0;}
+
+static int mouse_gestures_allowed(const View*v,int command_mode){return !v->help&&!command_mode;}
 
 static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint64_t scale,uint64_t cursor,double mouse_speed,int font_scale) {
     Display d; View v={0}; RenderCache cache={0}; char in[256],command[128]; uint8_t mouse_buf[3];size_t mouse_n=0,cmdn=0; int command_mode=0,present_dirty=1,grid_dirty=1,n,i;
@@ -572,7 +569,7 @@ static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint6
     stopping=0;
     if(install_signal_handlers()<0)return -1;
     if(display_open(&d,fb,mouse)<0){display_close(&d);return -1;}d.mouse_speed=mouse_speed;d.font_scale=font_scale;d.mouse_x=(int)d.var.xres/2;d.mouse_y=(int)d.var.yres/2;
-    while(!stopping){int cols=d.var.xres/cell,rows=((int)d.var.yres-22*font_scale)/cell;uint64_t page=(uint64_t)cols*rows*scale;
+    while(!stopping){int cols=d.var.xres/cell,rows=((int)d.var.yres-22*font_scale)/cell;
         struct pollfd fds[2]={{d.tty,POLLIN,0},{d.mouse,POLLIN,0}};
         uint64_t old_view=v.view;
         scale=v.scale;cursor=v.cursor;if(cursor>=s->size&&s->size)cursor=s->size-1;
@@ -580,7 +577,7 @@ static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint6
         if(v.view!=old_view)grid_dirty=1;
         if(present_dirty||grid_dirty){if(render(&d,s,&v,&cache,grid_dirty)<0)break;present_dirty=grid_dirty=0;}
         if(poll(fds,d.mouse>=0?2:1,-1)<0){if(errno==EINTR)continue;break;}
-        if(d.mouse>=0&&(fds[1].revents&POLLIN)){uint8_t buf[48];ssize_t got=read(d.mouse,buf,sizeof(buf));ssize_t z;if(got>0)for(z=0;z<got;z++){if(!mouse_n&&!(buf[z]&8))continue;mouse_buf[mouse_n++]=buf[z];if(mouse_n==3){mouse_event(&d,&v,s,&cache,mouse_buf);mouse_n=0;present_dirty=1;}}}
+        if(d.mouse>=0&&(fds[1].revents&POLLIN)){uint8_t buf[48];ssize_t got=read(d.mouse,buf,sizeof(buf));ssize_t z;if(got>0)for(z=0;z<got;z++){if(!mouse_n&&!(buf[z]&8))continue;mouse_buf[mouse_n++]=buf[z];if(mouse_n==3){if(mouse_gestures_allowed(&v,command_mode))mouse_event(&d,&v,s,&cache,mouse_buf);mouse_n=0;present_dirty=1;}}}
         if(!(fds[0].revents&POLLIN))continue;
         n=read_key(d.tty,in,sizeof(in));if(n<0)break;
         for(i=0;i<n;i++){unsigned char k=in[i];uint64_t move=0,old_cursor=cursor;
@@ -596,12 +593,12 @@ static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint6
             if(k==':' ){command_mode=1;cmdn=0;show_command(&d,cell,command,cmdn);continue;}
             if(k=='g'){command_mode=1;memcpy(command,"g ",2);cmdn=2;show_command(&d,cell,command,cmdn);continue;}
             if(k=='q'){stopping=1;break;}
-            if(k=='i'){uint64_t cell_start=v.view+((v.cursor-v.view)/v.scale)*v.scale,span=s->size-cell_start<v.scale?s->size-cell_start:v.scale;v.inspect=!v.inspect;v.inspect_focus=v.inspect?(span>1024?cell_start+(span-1024)/2:cell_start):UINT64_MAX;cache.inspect_valid=0;cache.baseline_n=0;snprintf(v.message,sizeof(v.message),"inspector %s",v.inspect?"open":"closed");present_dirty=1;continue;}
+            if(k=='i'){uint64_t cell_start=v.view+((v.cursor-v.view)/v.scale)*v.scale,span=s->size-cell_start<v.scale?s->size-cell_start:v.scale;v.inspect=!v.inspect;v.inspect_focus=v.inspect?representative_start(cell_start,span):UINT64_MAX;cache.inspect_valid=0;cache.baseline_n=0;snprintf(v.message,sizeof(v.message),"inspector %s",v.inspect?"open":"closed");present_dirty=1;continue;}
             if(v.inspect&&(k==','||k=='<'||k=='.'||k=='>')){v.inspect_page=(v.inspect_page+(k==','||k=='<'?6:1))%7;snprintf(v.message,sizeof(v.message),"inspect %s",page_names[v.inspect_page]);present_dirty=1;continue;}
             if(k>='1'&&k<='6'){v.lens=k-'0';present_dirty=1;snprintf(v.message,sizeof(v.message),"view %d: %s",v.lens,lens_names[v.lens]);continue;}
             if(k=='a'||k=='h')move=scale>cursor?cursor:scale,cursor-=move;else if(k=='d'||k=='l')cursor+=scale;else if(k=='w'||k=='k')move=(uint64_t)cols*scale,cursor-=move>cursor?cursor:move;else if(k=='s'||k=='j')cursor+=(uint64_t)cols*scale;
             else if(k=='-'||k=='='||k=='_'||k=='+'||k=='\r'||k=='\n'){int inward=k=='='||k=='+'||k=='\r'||k=='\n',steps=k=='_'||k=='+'?4:1;uint64_t old=scale;if(v.inspect&&v.inspect_focus<s->size)cursor=v.inspect_focus;scale=zoom_scale(scale,inward,steps);v.scale=scale;v.cursor=cursor;center_view(&v,s->size,(uint64_t)cols*rows);cache.inspect_valid=0;cache.baseline_n=0;grid_dirty=1;snprintf(v.message,sizeof(v.message),scale==old?"already at zoom limit":"scale %lluB/cell",(unsigned long long)scale);
-            } else if(k==0x1b&&i+2<n&&in[i+1]=='['){unsigned char z=in[i+2];i+=2;if(z=='A')cursor-=(uint64_t)cols*scale>cursor?cursor:(uint64_t)cols*scale;else if(z=='B')cursor+=(uint64_t)cols*scale;else if(z=='C')cursor+=scale;else if(z=='D')cursor-=scale>cursor?cursor:scale;else if((z=='5'||z=='6')&&i+1<n&&in[i+1]=='~'){uint64_t half=page/2;i++;if(z=='5')cursor-=half>cursor?cursor:half;else cursor+=half;}}
+            } else if(k==0x1b&&i+2<n&&in[i+1]=='['){unsigned char z=in[i+2];i+=2;if(z=='A')cursor-=(uint64_t)cols*scale>cursor?cursor:(uint64_t)cols*scale;else if(z=='B')cursor+=(uint64_t)cols*scale;else if(z=='C')cursor+=scale;else if(z=='D')cursor-=scale>cursor?cursor:scale;else if((z=='5'||z=='6')&&i+1<n&&in[i+1]=='~'){uint64_t half=half_page_bytes((uint64_t)cols*rows,scale);i++;if(z=='5')cursor-=half>cursor?cursor:half;else cursor+=half;}}
             else if(k==27){if(v.inspect){v.inspect=0;v.inspect_focus=UINT64_MAX;present_dirty=1;continue;}if(v.selection_end>v.selection_start){v.selection_start=v.selection_end=0;snprintf(v.message,sizeof(v.message),"selection cleared");present_dirty=1;continue;}continue;}
             v.cursor=cursor;v.scale=scale;if(v.inspect&&cursor!=old_cursor)capture_baseline(&v,&cache);if(v.inspect&&v.inspect_focus<s->size&&cursor!=old_cursor){int64_t delta=cursor>=old_cursor?(int64_t)(cursor-old_cursor):-(int64_t)(old_cursor-cursor);if(delta<0&&(uint64_t)(-delta)>v.inspect_focus)v.inspect_focus=0;else v.inspect_focus=(uint64_t)((int64_t)v.inspect_focus+delta);if(v.inspect_focus>=s->size&&s->size)v.inspect_focus=s->size-1;cache.inspect_valid=0;}present_dirty=1;
         }

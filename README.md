@@ -32,6 +32,9 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Unified native viewport classification and lens sampling into one bounded
+  batch/coarse-read path, cached recolored grids across presentation redraws,
+  and fixed half-page, drag-focus, dump-safety, and overlay mouse semantics.
 - Completed the native viewer's six byte lenses and seven inspector pages,
   including context sampling, numeric and statistical details, signature scans,
   exact-focus centering, range context, and byte-level difference highlighting.

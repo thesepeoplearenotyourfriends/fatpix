@@ -320,6 +320,7 @@ int main(void) {
     View view = {0};
     RenderCache cache = {0};
     char path[] = "/tmp/fatpix-cache-XXXXXX";
+    char alias[128];
     unsigned char bytes[1024];
     int fd, result, panel_x, panel_y;
 
@@ -328,6 +329,8 @@ int main(void) {
     if (fd < 0 || write(fd, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes)) return 1;
     close(fd);
     if (source_open(&source, path) < 0) return 2;
+    snprintf(alias, sizeof(alias), "%s.alias", path);
+    if (link(path, alias) < 0) return 2;
     unlink(path);
     display.fd = display.tty = display.mouse = -1;
     display.var.xres = 140; display.var.yres = 100; display.var.bits_per_pixel = 32;
@@ -338,11 +341,19 @@ int main(void) {
     display.map = calloc(1, display.map_len); display.back = calloc(1, display.map_len);
     view.scale = 1; view.cell = 14; view.cursor = 128; view.inspect = 1;
     if (!display.map || !display.back || render(&display, &source, &view, &cache, 1) < 0) return 3;
+    if (source.read_calls != 2) return 18; /* one viewport batch plus inspector */
+    view.selection_start = 0; view.selection_end = 16;
+    if (dump_selection(&source, &view, alias) == 0) return 19;
+    unlink(alias);
 
     close(source.fd); source.fd = -1;
     view.cursor++; view.selection_start = 128; view.selection_end = 130;
     display.mouse_x++; display.mouse_y++;
-    result = render(&display, &source, &view, &cache, 0);
+    {
+        uint64_t recolors = cache.recolor_count;
+        result = render(&display, &source, &view, &cache, 0);
+        if (cache.recolor_count != recolors) return 20;
+    }
     view.selecting = 1;
     display.mouse_y = display.var.yres - 1;
     mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 0, 0});
@@ -382,6 +393,17 @@ int main(void) {
     if (view.view != 8 || (view.cursor - view.view) / view.scale != 5) return 13;
     if (zoom_scale(4, 0, 1) != 6 || zoom_scale(4, 1, 1) != 3 ||
         zoom_scale(4, 0, 4) != 12 || zoom_scale(4, 1, 4) != 1) return 14;
+    if (half_page_bytes(9, 3) != 12 || representative_start(100, 2048) != 612) return 21;
+    view.help = 1; if (mouse_gestures_allowed(&view, 0)) return 23;
+    view.help = 0; if (mouse_gestures_allowed(&view, 1) || !mouse_gestures_allowed(&view, 0)) return 23;
+    display.var.xres = 800; display.var.yres = 600; display.font_scale = 1;
+    display.mouse_x = 100; display.mouse_y = 300; display.mouse_speed = 1.0;
+    source.size = 16 * 1024 * 1024; view.cell = 10; view.view = 0; view.scale = 2048;
+    view.cursor = 0; view.inspect = 1;
+    mouse_event(&display, &view, &source, &cache, (const uint8_t[]){9, 0, 0});
+    mouse_event(&display, &view, &source, &cache, (const uint8_t[]){9, 10, 0});
+    if (view.inspect_focus != representative_start(view.cursor, view.scale)) return 22;
+    mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 0, 0});
     if (classify_lens(2, (const uint8_t[]){0xaa,0xaa}, 2, 0xaa, NULL, 0, NULL, 0).color != 0 ||
         classify_lens(3, (const uint8_t[]){0,255}, 2, 0, NULL, 0, NULL, 0).color != 7 ||
         lens_number("neighbor") != 5 || lens_number("d") != 3) return 15;
@@ -431,8 +453,14 @@ int main(int argc, char **argv) {
     if (argc != 4 || source_open(&source, argv[1]) < 0) return 1;
     view.scale = strtoull(argv[2], NULL, 10); view.lens = atoi(argv[3]);
     cache.count = 8; cache.cells = calloc(cache.count, sizeof(*cache.cells));
-    if (!cache.cells || make_grid(&source, 0, view.scale, cache.count, cache.cells) < 0 ||
-        load_samples(&source, &view, &cache) < 0) return 2;
+    cache.samples = calloc(cache.count, SAMPLE_MAX); cache.contexts = calloc(cache.count, SAMPLE_MAX);
+    cache.previous = calloc(cache.count, 1); cache.sample_n = calloc(cache.count, sizeof(*cache.sample_n));
+    cache.context_n = calloc(cache.count, sizeof(*cache.context_n));
+    if (!cache.cells || !cache.samples || !cache.contexts || !cache.previous || !cache.sample_n || !cache.context_n ||
+        make_grid_data(&source, 0, view.scale, cache.count, cache.cells, cache.samples, cache.contexts,
+                       cache.previous, cache.sample_n, cache.context_n) < 0) return 2;
+    if (view.scale > BATCH_MAX / cache.count && source.size >= view.scale * cache.count &&
+        source.read_calls != cache.count) return 3;
     if (view.lens != 1) recolor_grid(&view, &cache);
     for (i = 0; i < cache.count; i++) printf("%u%c", cache.cells[i].color, i == 7 ? '\n' : ' ');
     return 0;
@@ -459,6 +487,20 @@ PY
         cmp "$c_out" "$py"
     done
 done
+"$tmp/fatpix-lens-probe" test/ext2.img 2097152 4 > "$tmp/c-coarse-lens"
+python3 - test/ext2.img 2097152 4 > "$tmp/py-coarse-lens" <<'PY'
+import runpy, sys
+ns = runpy.run_path("fatpix")
+source = ns["ByteSource"](path=sys.argv[1])
+app = ns["FatPix"](file_source=source, file_label=sys.argv[1])
+app.w, app.h = 8, 1
+app.file_bytes_per_cell = int(sys.argv[2])
+app.file_view_start = app.file_cursor_addr = 0
+app.refresh_file_grid(); app.set_file_lens(int(sys.argv[3]))
+print(" ".join(str(value) for value in app.grid[0]))
+source.close()
+PY
+cmp "$tmp/c-coarse-lens" "$tmp/py-coarse-lens"
 printf 'FatPix Python/C parity: all six lenses agree at byte and context-sampling scales\n'
 
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
