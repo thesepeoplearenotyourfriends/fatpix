@@ -27,7 +27,7 @@
 #define SAMPLE_MAX 1024
 #define BATCH_MAX (8u * 1024u * 1024u)
 #define CELL_DEFAULT 14
-#define MOUSE_SPEED_DEFAULT 1.0
+#define MOUSE_SPEED_DEFAULT 3.0
 #define FONT_SCALE_DEFAULT 2
 
 typedef struct {
