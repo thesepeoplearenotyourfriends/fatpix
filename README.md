@@ -8,6 +8,17 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Coalesced buffered FatPix zoom repeats so only the final requested viewport is
+  read and rendered.
+- Restored separate small and large FatPix zoom steps and added abbreviated
+  `goto`/`scale` commands with fractional binary-unit scale targets.
+- Displayed FatPix selections as inclusive human-readable byte ranges while
+  retaining half-open ranges internally.
+- Identified corroborated ELF objects embedded within larger byte streams while
+  reporting truncated projections separately from identity confidence.
+- Simplified FatPix's permanent file footer and moved cell diagnostics into its
+  inspector pages.
+- Removed a stale acceptance reference to a deleted corrupt JPEG fixture.
 - Grounded SQLite opaque-page ownership in an explicit KSY page-size/page-count
   extent relationship instead of inferring geometry from matching scalars.
 - Completed whole-file projection for the real PNG, ZIP, SQLite, and WAV

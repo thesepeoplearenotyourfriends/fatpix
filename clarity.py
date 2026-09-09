@@ -1604,7 +1604,29 @@ def parse_ksy_structure(
                 values[f"{path}.{param['id']}"] = value
         elif params:
             raise KsyError(f"type {path} requires parameters")
-        endian = _ksy_endian(effective_doc, type_def if type_def is not effective_doc else None)
+        endian_spec = None
+        if type_def is not effective_doc:
+            endian_spec = type_def.get("endian")
+            if endian_spec is None and isinstance(type_def.get("meta"), dict):
+                endian_spec = type_def["meta"].get("endian")
+        if isinstance(endian_spec, dict) and "switch-on" in endian_spec:
+            switch_value = _ksy_eval(endian_spec["switch-on"], scope, cursor)
+            cases = endian_spec.get("cases", {})
+            if not isinstance(cases, dict):
+                raise KsyUnsupported(f"endian switch cases on {path} must be a mapping")
+            selected = None
+            for case_key, case_endian in cases.items():
+                if switch_value == _ksy_case_value(case_key, effective_doc, scope.enums):
+                    selected = case_endian
+                    break
+            if selected not in {"le", "be"}:
+                raise KsyUnsupported(f"endian switch on {path} has no matching case")
+            endian = "little" if selected == "le" else "big"
+        else:
+            endian = _ksy_endian(
+                effective_doc,
+                ({"endian": endian_spec} if endian_spec is not None else None),
+            )
         bit_endian = type_def.get("bit-endian", effective_doc.get("meta", {}).get("bit-endian", "be"))
         if bit_endian not in {"be", "le"}:
             raise KsyUnsupported(f"unsupported bit-endian {bit_endian!r}")
@@ -2364,10 +2386,14 @@ def auto_ksy_views(
             search_from = 0
             matches = 0
             while len(out) < limit:
-                # Two- and four-byte signatures may nominate an object only at
-                # their statically expected position.  Do not hunt arbitrary
-                # payloads for cheap short-magic coincidences.
-                if len(magic) < 5:
+                # Cheap or repetitive short signatures may nominate an object
+                # only at their statically expected position.  A four-byte
+                # signature with four distinct values is selective enough to
+                # expose an embedded structural candidate; the root-offset
+                # identity rule below still prevents that clue alone from
+                # becoming a whole-input claim.
+                globally_distinct = len(magic) > 4 or (len(magic) == 4 and len(set(magic)) == 4)
+                if not globally_distinct:
                     # Common short clues are local corroborators: they can
                     # nominate the supplied root, but are never scanned across
                     # arbitrary payload bytes.
@@ -2500,7 +2526,16 @@ def auto_ksy_views(
                     ),
                 }
                 independent = sum(bool(value) for key, value in evidence.items() if key != "anchor")
-                strong = not failed and root_local == 0 and independent >= 1
+                # An embedded four-byte clue also needs parsed corroboration to
+                # remain visible.  This keeps coincidental words such as WAVE
+                # in arbitrary payload bytes from becoming partial views.
+                if len(magic) == 4 and root_local != 0 and independent < 1:
+                    continue
+                # Location, identity, and projection completeness are separate.
+                # A corroborated object may be identified inside a larger input,
+                # and a later truncation may leave that identity intact while
+                # limiting only the byte projection.
+                strong = not failed and independent >= 1
                 out.append({
                     "kind": "ksy_structure",
                     "ksy_id": ksy_id,
@@ -2714,7 +2749,7 @@ def mbr_identity_claims(data: bytes, base_offset: int = 0, limit: int = MAX_IDEN
     return claims
 
 
-def validate_elf_at(data: bytes, offset: int) -> dict | None:
+def validate_elf_at(data: bytes, offset: int, *, allow_partial: bool = False) -> dict | None:
     """Validate enough ELF structure to make an identity claim, not just a magic hit."""
     remaining = len(data) - offset
     if remaining < 52 or data[offset:offset + 4] != b"\x7fELF":
@@ -2763,12 +2798,18 @@ def validate_elf_at(data: bytes, offset: int) -> dict | None:
     # half-parsed and promoted to identity claims.
     if e_phnum == 0xffff:
         return None
+    issues = []
+    ph_available = True
+    sh_available = True
     if e_phnum:
         if e_phentsize != phentsize_expected or e_phoff < ehsize_expected:
             return None
         ph_end = e_phoff + e_phentsize * e_phnum
         if ph_end > remaining:
-            return None
+            if not allow_partial:
+                return None
+            ph_available = False
+            issues.append("program header table lies beyond available bytes")
     else:
         ph_end = ehsize_expected
     if e_shnum:
@@ -2776,7 +2817,10 @@ def validate_elf_at(data: bytes, offset: int) -> dict | None:
             return None
         sh_end = e_shoff + e_shentsize * e_shnum
         if sh_end > remaining:
-            return None
+            if not allow_partial:
+                return None
+            sh_available = False
+            issues.append("section header table lies beyond available bytes")
     else:
         sh_end = ehsize_expected
 
@@ -2784,7 +2828,7 @@ def validate_elf_at(data: bytes, offset: int) -> dict | None:
 
     # Program headers: include every file-backed segment's end in the minimum
     # extent and reject references that escape the supplied byte stream.
-    for i in range(e_phnum):
+    for i in range(e_phnum if ph_available else 0):
         pos = offset + e_phoff + i * e_phentsize
         if elf_class == 1:
             p_offset = _uint(data, pos + 4, 4, byteorder)
@@ -2794,12 +2838,15 @@ def validate_elf_at(data: bytes, offset: int) -> dict | None:
             p_filesz = _uint(data, pos + 32, 8, byteorder)
         end = p_offset + p_filesz
         if end > remaining:
-            return None
+            if not allow_partial:
+                return None
+            issues.append(f"program segment {i} lies beyond available bytes")
+            continue
         referenced_end = max(referenced_end, end)
 
     # Section headers add file-backed section extents. SHT_NOBITS (8) occupies
     # memory but no bytes in the file, so it is intentionally excluded.
-    for i in range(e_shnum):
+    for i in range(e_shnum if sh_available else 0):
         pos = offset + e_shoff + i * e_shentsize
         sh_type = _uint(data, pos + 4, 4, byteorder)
         if elf_class == 1:
@@ -2812,7 +2859,10 @@ def validate_elf_at(data: bytes, offset: int) -> dict | None:
             continue
         end = sh_offset + sh_size
         if end > remaining:
-            return None
+            if not allow_partial:
+                return None
+            issues.append(f"section {i} lies beyond available bytes")
+            continue
         referenced_end = max(referenced_end, end)
 
     return {
@@ -2825,17 +2875,21 @@ def validate_elf_at(data: bytes, offset: int) -> dict | None:
         "program_headers": e_phnum,
         "section_headers": e_shnum,
         "minimum_referenced_extent": referenced_end,
+        "partial": bool(issues),
+        "issues": issues,
     }
 
 
-def elf_identity_claims(data: bytes, limit: int = MAX_IDENTITY_CLAIMS) -> list[dict]:
+def elf_identity_claims(
+    data: bytes, limit: int = MAX_IDENTITY_CLAIMS, *, allow_partial: bool = False
+) -> list[dict]:
     claims = []
     start = 0
     while len(claims) < limit:
         off = data.find(b"\x7fELF", start)
         if off < 0:
             break
-        found = validate_elf_at(data, off)
+        found = validate_elf_at(data, off, allow_partial=allow_partial)
         if found is not None:
             claims.append(found)
         start = off + 1
@@ -3042,13 +3096,19 @@ def analysis_result(
             and int(view.get("offset", -1)) in strong_roots
         )
     ]
+    elf_claims = elf_identity_claims(data, allow_partial=True)
+    validated_elf_offsets = {base_offset + int(claim["offset"]) for claim in elf_claims}
     identity = [
         claim
         for view in views
         if (claim := mbr_identity_claim_from_view(view)) is not None
     ]
     for view in views:
-        if view.get("kind") == "ksy_structure" and view.get("strong_identity"):
+        if (
+            view.get("kind") == "ksy_structure"
+            and view.get("strong_identity")
+            and not (view.get("ksy_id") == "elf" and int(view["offset"]) in validated_elf_offsets)
+        ):
             identity.append({
                 "kind": "ksy_identity",
                 "ksy_id": view["ksy_id"],
@@ -3062,7 +3122,6 @@ def analysis_result(
             })
     # ELF offsets are local to the supplied byte stream; translate them into the
     # same global coordinate space used by structural views.
-    elf_claims = elf_identity_claims(data)
     for claim in elf_claims:
         claim = dict(claim)
         claim["offset"] += base_offset
@@ -3219,10 +3278,15 @@ def print_analysis(
                     "  minimum structurally referenced extent: "
                     f"{claim['minimum_referenced_extent']} bytes"
                 )
+                if claim.get("partial"):
+                    print("  projection: partial")
+                    for issue in claim.get("issues", [])[:1]:
+                        print(f"  unresolved: {issue}")
                 print()
             elif claim["kind"] == "ksy_identity":
                 suffix = " (partial)" if claim.get("partial") else ""
-                print(f"CLAIM: structurally validated {claim['ksy_id']} object{suffix}")
+                embedded = "embedded " if claim["offset"] else ""
+                print(f"CLAIM: structurally validated {embedded}{claim['ksy_id']} object{suffix}")
                 print(f"  offset: 0x{claim['offset']:x}  projected extent: {claim['extent']} bytes")
                 print(f"  shape source: {claim['shape_source']}")
                 print()

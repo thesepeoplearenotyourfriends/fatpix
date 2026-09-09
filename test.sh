@@ -213,6 +213,89 @@ for raw, expected in (
 print("RawTerminal navigation queue: bounded repeats, lossless commands, preemptive quit")
 PY
 
+# File-view status remains a compact orientation aid.  Detailed cell metrics
+# stay available through inspector_lines(STATS/RANGE/HEX), not in the footer.
+python3 - <<'PY'
+import importlib.machinery, importlib.util, re
+
+loader = importlib.machinery.SourceFileLoader("fatpix_status_test", "fatpix")
+spec = importlib.util.spec_from_loader(loader.name, loader)
+fatpix = importlib.util.module_from_spec(spec)
+loader.exec_module(fatpix)
+
+app = fatpix.FatPix(file_source=fatpix.ByteSource(data=bytes(range(256))), file_label="/tmp/deep/sample.bin")
+status = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", app.render_status())
+first, second = status.split("\n", 1)
+assert first == "file=sample.bin  scale=1B  pos=0x0  view=literal  clarity=off", first
+assert second == "? help", second
+for obsolete in ("cursor=", "cell=", "sel=", "byte=", "kind=", " H=", "zero=", "text="):
+    assert obsolete not in status, (obsolete, status)
+
+app.file_selection_start = 16
+app.file_selection_end = 80
+app.message = "selected 64 B"
+status = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", app.render_status())
+assert "pos=0x10..0x4f" in status, status
+assert status.split("\n", 1)[1] == "? help | selected 64 B", status
+
+app.inspect_page = app.inspect_pages.index("STATS")
+stats = "\n".join(app.inspector_lines(100, 20))
+assert "entropy=" in stats and "zero=" in stats and "printable=" in stats, stats
+
+# Shifted zoom keys jump several positions on the same scale ladder.  They must
+# remain distinct from the ordinary one-step keys and retain inspector focus.
+source = fatpix.ByteSource(data=bytes(range(256)) * 256)
+app = fatpix.FatPix(file_source=source, file_label="zoom.bin")
+app.set_file_scale(64)
+app.inspect_open = True
+app.inspect_focus_addr = 0x1234
+app.handle_key("=")
+small_in = app.file_bytes_per_cell
+assert app.file_cursor_addr == 0x1234
+app.set_file_scale(64)
+app.handle_key("+")
+large_in = app.file_bytes_per_cell
+assert large_in < small_in < 64, (large_in, small_in)
+assert app.file_cursor_addr == 0x1234
+app.set_file_scale(64)
+app.handle_key("-")
+small_out = app.file_bytes_per_cell
+app.set_file_scale(64)
+app.handle_key("_")
+large_out = app.file_bytes_per_cell
+assert 64 < small_out < large_out, (small_out, large_out)
+
+app.run_command("s 10K")
+assert app.file_bytes_per_cell == 10 * 1024
+app.run_command("scale 1.5M")
+assert app.file_bytes_per_cell == 1572864
+app.run_command("g 0xBEEF")
+assert app.file_cursor_addr == 0xBEEF
+
+# A buffered repeat run updates all requested ladder positions before the first
+# expensive viewport read.  Event order stops coalescing at the first other key.
+app = fatpix.FatPix(file_source=source, file_label="zoom.bin")
+app.set_file_scale(64)
+refreshes = 0
+original_refresh = app.refresh_file_grid
+def counted_refresh():
+    global refreshes
+    refreshes += 1
+    return original_refresh()
+app.refresh_file_grid = counted_refresh
+term = fatpix.RawTerminal(-1)
+term._events.extend(["="] * 6 + ["x", "="])
+first = term.read_key()
+assert fatpix.handle_key_batch(app, term, first)
+assert refreshes == 0, refreshes
+assert app.file_bytes_per_cell == fatpix.FILE_SCALE_LADDER[fatpix.FILE_SCALE_LADDER.index(64) - 6]
+assert list(term._events) == ["x", "="], list(term._events)
+if app.file_dirty:
+    app.refresh_file_grid()
+assert refreshes == 1, refreshes
+print("FatPix file status: compact position, selection, view, and Clarity state")
+PY
+
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
 python3 clarity.py --stats "$tmp/probe-xor.grb" > "$tmp/explicit-stats.txt"
@@ -998,13 +1081,83 @@ check_real_identity test/sample.sqlite sqlite3
 check_real_identity test/sample.avi avi
 check_real_identity test/sample.mp3 id3v2_3
 # This specimen's suffix is misleading; its bytes are an ordinary gzip stream.
-check_real_identity test/george.jpg gzip
 check_real_identity test/george2.jpg jpeg
 check_real_identity test/sample.wav wav
 check_real_identity test/fat.img vfat
 check_real_identity test/ext2.img ext2
 [ -f test/cmd.exe ] || { echo "FAIL: missing acceptance specimen test/cmd.exe" >&2; exit 1; }
 check_real_identity test/cmd.exe microsoft_pe
+
+# The in-stream specimen is a truncated cpio member: its ELF header and scalar
+# constraints are present at offset 832, while its section table lies beyond the
+# available bytes.  Identify the embedded object while retaining its incomplete
+# projection and without describing the enclosing stream as an ELF root.
+./clarity.py --analyze --json test/elf_x86_64_in-stream.elf > "$tmp/in-stream-elf.json"
+python3 - "$tmp/in-stream-elf.json" <<'PY'
+import json, sys
+
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+views = [
+    view for view in obj.get("views", [])
+    if view.get("ksy_id") == "elf" and view.get("offset") == 832
+]
+if len(views) != 1:
+    raise SystemExit(f"FAIL: expected one ELF structural view at offset 832; got {len(views)}")
+view = views[0]
+if not view.get("partial") or not view.get("strong_identity"):
+    raise SystemExit("FAIL: truncated embedded ELF must retain identity and a partial projection")
+if not any("section_headers offset outside selected stream" in issue for issue in view.get("issues", [])):
+    raise SystemExit(f"FAIL: missing ELF truncation reason: {view.get('issues', [])}")
+claims = [claim for claim in obj.get("claims", []) if claim.get("kind") == "elf"]
+if len(claims) != 1 or claims[0].get("offset") != 832:
+    raise SystemExit(f"FAIL: missing embedded ELF identity claim: {claims}")
+if not claims[0].get("partial") or claims[0].get("class_bits") != 64 or claims[0].get("endian") != "little":
+    raise SystemExit("FAIL: embedded ELF identity lost projection completeness")
+values = {a.get("path"): a.get("value") for a in view.get("annotations", [])}
+expected = {
+    "elf.bits": 2,
+    "elf.endian": 1,
+    "elf.ei_version": 1,
+    "elf.header.e_type": 1,
+    "elf.header.machine": 62,
+    "elf.header.e_version": 1,
+    "elf.header.e_ehsize": 64,
+    "elf.header.section_header_entry_size": 64,
+    "elf.header.qty_section_header": 77,
+}
+if any(values.get(path) != value for path, value in expected.items()):
+    raise SystemExit(f"FAIL: embedded ELF header validation changed: {values}")
+PY
+
+# FatPix supplies a bounded window and an absolute base offset.  It must receive
+# the same embedded object and absolute annotation coordinates.
+dd if=test/elf_x86_64_in-stream.elf of="$tmp/elf-window.bin" bs=1 skip=768 status=none
+./clarity.py --analyze --json --windowed --base-offset 0x300 "$tmp/elf-window.bin" > "$tmp/elf-window.json"
+python3 - "$tmp/elf-window.json" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+views = [v for v in obj.get("views", []) if v.get("ksy_id") == "elf"]
+if len(views) != 1 or views[0].get("offset") != 832 or not views[0].get("strong_identity"):
+    raise SystemExit(f"FAIL: windowed embedded ELF identity/offset changed: {views}")
+claims = [c for c in obj.get("claims", []) if c.get("kind") == "elf"]
+if len(claims) != 1 or claims[0].get("offset") != 832 or not claims[0].get("partial"):
+    raise SystemExit(f"FAIL: windowed embedded ELF claim changed: {claims}")
+if not all(int(a["start"]) >= 768 for a in views[0].get("annotations", [])):
+    raise SystemExit("FAIL: windowed ELF annotations are not absolute")
+PY
+
+# Magic alone nominates nothing: malformed header geometry and values cannot
+# earn either a structural identity view or an ELF identity claim.
+printf 'prefix\177ELFbroken incidental bytes' > "$tmp/incidental-elf.bin"
+./clarity.py --analyze --json "$tmp/incidental-elf.bin" > "$tmp/incidental-elf.json"
+python3 - "$tmp/incidental-elf.json" <<'PY'
+import json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+if any(v.get("ksy_id") == "elf" and v.get("strong_identity") for v in obj.get("views", [])):
+    raise SystemExit("FAIL: incidental ELF magic earned structural identity")
+if any(c.get("kind") in {"elf", "ksy_identity"} for c in obj.get("claims", [])):
+    raise SystemExit("FAIL: incidental ELF magic earned an identity claim")
+PY
 
 # Identity and byte-map acceptance are deliberately separate.  A known whole
 # file is fully projected only when annotations owned by its primary format
@@ -1173,8 +1326,8 @@ require(any((v.get('hard_contradictions') for v in views)), "assertion failed: a
 PY
 
 # Strong anchors remain root-relative during structural scanning. Two complete
-# PNGs at nonzero offsets must yield two hypotheses, while common PK bytes in the
-# surrounding payload must not nominate embedded ZIP identities.
+# PNGs at nonzero offsets must yield two embedded identities, while common PK
+# bytes in the surrounding payload must not nominate embedded ZIP identities.
 python3 - <<'PY' > "$tmp/two-embedded-pngs"
 import sys
 png = open("test/sample.png", "rb").read()
@@ -1190,7 +1343,9 @@ def require(condition, message):
 obj = json.load(open(sys.argv[1], encoding="utf-8"))
 pngs = [v for v in obj["views"] if v.get("ksy_id") == "png"]
 require(len({v['offset'] for v in pngs}) == 2, "assertion failed: len({v['offset'] for v in pngs}) == 2")
-require(all((not v.get('strong_identity') for v in pngs)), "assertion failed: all((not v.get('strong_identity') for v in pngs))")
+require(all((v.get('strong_identity') for v in pngs)), "assertion failed: all((v.get('strong_identity') for v in pngs))")
+claims = [c for c in obj.get('claims', []) if c.get('kind') == 'ksy_identity' and c.get('ksy_id') == 'png']
+require({c['offset'] for c in claims} == {v['offset'] for v in pngs}, "embedded PNG claims do not match views")
 require(not any((v.get('ksy_id') == 'zip' for v in obj['views'])), "assertion failed: not any((v.get('ksy_id') == 'zip' for v in obj['views']))")
 PY
 

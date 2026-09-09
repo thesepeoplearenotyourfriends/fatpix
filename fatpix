@@ -13,7 +13,8 @@ Run:
 File view:
   arrows / wasd   move byte cursor
   PgUp / PgDn     move cursor by half the visible page
-  - / =           zoom out / in (_ / + also work)
+  - / =           small zoom step out / in
+  _ / +           larger zoom jump out / in
   1-6             analysis lenses
   i               inspector overlay
   , / .           inspector previous / next page (HEX wraps to DIFF HEX)
@@ -221,8 +222,9 @@ FILE_SCALE_LADDER = _build_file_scale_ladder()
 
 FILE_HELP_TEXT = [
     "fatpix file view — bytes as fat pixels",
-    "nav: arrows/wasd move | PgUp/PgDn half-page | -/= zoom | g goto | i inspect",
-    "     C Clarity semantic view | c Clarity legend | : command | ? help",
+    "nav: arrows/wasd move | PgUp/PgDn half-page | -/= zoom | _/+ larger jump",
+    "     g goto | i inspect | C Clarity semantic view | c Clarity legend",
+    "     : command | ? help",
     "",
     "LENSES / COLOR KEY",
     "1 literal 1B: 00 black | ff white | printable 20-7e green",
@@ -246,7 +248,8 @@ FILE_HELP_TEXT = [
     "  selection keeps exact byte endpoints across zoom/resize; Esc clears when inspect is closed",
     "  Shift-drag is normally the terminal's own text selection while mouse mode is active",
     "H=Shannon entropy (bits/byte). JSD uses 16 byte-value bins.",
-    "commands: goto <offset> | scale <bytes> | view <1-6|name> | dump <file> | clarity",
+    "commands: goto|g <offset> | scale|s <bytes|10K|1.5M> | view <1-6|name>",
+    "          dump <file> | clarity",
     "Clarity: known fields replace byte/lens colors; matching circles mark real field starts.",
     "cursor is an exact byte address; zoom changes bytes summarized per cell.",
 ]
@@ -259,7 +262,8 @@ INSPECT_HELP_TEXT = [
     "< / >         shifted aliases for , / .",
     "arrows / wasd move the underlying byte cursor",
     "PgUp / PgDn  move cursor by half the visible byte span",
-    "- / =         zoom out / in (_ / + are aliases)",
+    "- / =         small zoom step out / in",
+    "_ / +         larger zoom jump out / in",
     "1-6           change FatPix lens while inspector stays open",
     "g             goto offset     : command line     q quit",
     "mouse         click/drag selects contiguous bytes; :dump FILE writes them",
@@ -357,6 +361,19 @@ def parse_offset(text: str) -> int:
     if text and text[-1] in multipliers:
         return int(text[:-1], 0) * multipliers[text[-1]]
     return int(text, 0)
+
+
+def parse_scale(text: str) -> int:
+    """Parse an integer byte count or a fractional binary-unit scale target."""
+    value = text.strip().lower()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmgt])b?", value)
+    if match is None:
+        return int(value, 0)
+    number, suffix = match.groups()
+    scaled = float(number) * {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[suffix]
+    if not math.isfinite(scaled) or not scaled.is_integer():
+        raise ValueError("scale target must resolve to a whole number of bytes")
+    return int(scaled)
 
 
 def human_size(value: int) -> str:
@@ -618,6 +635,22 @@ class RawTerminal:
                 self._parse_input()
         return self._events.popleft() if self._events else None
 
+    def read_queued_key_if(self, accepted):
+        """Pop the next pending event only when it is in ``accepted``.
+
+        If the parsed queue is empty, poll the terminal once so bytes already
+        waiting in the kernel join the same coalesced input run.  A different
+        event is put back at the front to preserve ordering.
+        """
+        if self._events:
+            return self._events.popleft() if self._events[0] in accepted else None
+        event = self.read_key()
+        if event in accepted:
+            return event
+        if event is not None:
+            self._events.appendleft(event)
+        return None
+
 
 class FatPix:
     def __init__(
@@ -641,7 +674,7 @@ class FatPix:
         self.selected = 6
         self.file_source = file_source
         self.private = private
-        self.file_label = "PR:[redacted]" if private and file_label else (f"PR:[{file_label}]" if file_label else "stdin")
+        self.file_label = "[redacted]" if private and file_label else (os.path.basename(file_label) if file_label else "stdin")
         self.clarity_path = clarity_path
         # enabled = user has the semantic lens switched on; active = this
         # viewport currently contains at least one recognized structural view.
@@ -1545,10 +1578,7 @@ class FatPix:
             self.recolor_file_grid()
 
         length = self.file_selection_end - self.file_selection_start
-        self.message = (
-            f"selected 0x{self.file_selection_start:x}..0x{self.file_selection_end:x} "
-            f"({human_size(length)})"
-        )
+        self.message = f"selected {human_size(length)}"
 
     def clear_file_selection(self) -> None:
         self.file_selection_anchor = None
@@ -1644,16 +1674,18 @@ class FatPix:
             name = "down" if direction > 0 else "up"
             self.message = f"half-page {name} {human_size(moved)}"
 
-    def zoom_file(self, inward: bool) -> None:
+    def zoom_file(self, inward: bool, steps: int = 1) -> None:
         if not self.file_mode:
             return
         old = self.file_bytes_per_cell
+        steps = max(1, int(steps))
         if inward:
             pos = bisect.bisect_left(FILE_SCALE_LADDER, old)
-            new = FILE_SCALE_LADDER[max(0, pos - 1)]
+            new = FILE_SCALE_LADDER[max(0, pos - steps)]
         else:
             pos = bisect.bisect_right(FILE_SCALE_LADDER, old)
-            new = FILE_SCALE_LADDER[pos] if pos < len(FILE_SCALE_LADDER) else old
+            target = min(len(FILE_SCALE_LADDER) - 1, pos + steps - 1)
+            new = FILE_SCALE_LADDER[target] if pos < len(FILE_SCALE_LADDER) else old
         if new == old:
             self.message = "already at zoom limit"
             return
@@ -1666,7 +1698,6 @@ class FatPix:
         self.file_bytes_per_cell = new
         self.invalidate_inspector_baseline()
         self.center_file_on_cursor()
-        self.refresh_file_grid()
         self.message = f"scale {human_size(self.file_bytes_per_cell)}/cell"
 
     def goto_file_offset(self, offset: int) -> None:
@@ -2275,40 +2306,16 @@ class FatPix:
                     + "\x1b[K"
                 )
 
-            info = self.current_file_info()
-            assert self.file_source is not None
-            scale = str(self.file_bytes_per_cell)
-            if info:
-                start = info["start"]
-                end = start + max(0, info["span"])
-                # cursor already names the exact 1-byte address; only spell out
-                # the cell extent when a coarse pixel actually spans a range.
-                locus = "" if info["span"] == 1 else f"cell=0x{start:x}..0x{end:x}"
-                detail = f"{locus} {info.get('lens_detail', '')}".strip()
-            else:
-                detail = "no cell"
-            selection = ""
+            scale = human_size(self.file_bytes_per_cell).replace(" ", "")
+            position = f"0x{self.file_cursor_addr:x}"
             if self.file_selection_start is not None and self.file_selection_end is not None:
-                selection = (
-                    f" sel=0x{self.file_selection_start:x}..0x{self.file_selection_end:x}"
-                    f"({human_size(self.file_selection_end - self.file_selection_start)})"
-                )
-            clarity = ""
-            if self.clarity_enabled:
-                ann = self.clarity_annotation_at(self.file_cursor_addr)
-                if ann is not None:
-                    path = str(ann.get('path', ann.get('label', 'view')))
-                    clarity = f" clarity=\x1b[1m{path}\x1b[22m"
-                elif self.clarity_active:
-                    clarity = " clarity=on"
-                else:
-                    clarity = " clarity=none"
+                position = f"0x{self.file_selection_start:x}..0x{self.file_selection_end - 1:x}"
+            clarity = "on" if self.clarity_enabled else "off"
             line1 = (
-                f"file={self.file_label} cursor=0x{self.file_cursor_addr:x} scale:{scale} "
-                f"size={human_size(self.file_source.size)}"
-                f"{clarity} {detail}{selection}"
+                f"file={self.file_label}  scale={scale}  pos={position}  "
+                f"view={FILE_LENSES[self.file_lens]}  clarity={clarity}"
             )
-            line2 = "? for help" + (f" | {self.message}" if self.message else "")
+            line2 = "? help" + (f" | {self.message}" if self.message else "")
             return (
                 "\x1b[0m"
                 + fit_line(line1, self.term_cols)
@@ -2392,10 +2399,14 @@ class FatPix:
                 self.move_file_cursor(-1, 0)
             elif key in ("RIGHT", "d", "l"):
                 self.move_file_cursor(1, 0)
-            elif key in ("=", "+", "\r", "\n"):
+            elif key in ("=", "\r", "\n"):
                 self.zoom_file(True)
-            elif key in ("-", "_"):
+            elif key == "+":
+                self.zoom_file(True, 4)
+            elif key == "-":
                 self.zoom_file(False)
+            elif key == "_":
+                self.zoom_file(False, 4)
             elif key == "g":
                 self.command_open = True
                 self.command = "goto "
@@ -2498,14 +2509,14 @@ class FatPix:
         op = parts[0].lower()
         args = parts[1:]
         try:
-            if self.file_mode and op == "goto":
+            if self.file_mode and op in ("goto", "g"):
                 if not args:
                     raise ValueError("goto needs an offset")
                 self.goto_file_offset(parse_offset(args[0]))
-            elif self.file_mode and op == "scale":
+            elif self.file_mode and op in ("scale", "s"):
                 if not args:
                     raise ValueError("scale needs bytes/cell")
-                self.set_file_scale(parse_offset(args[0]))
+                self.set_file_scale(parse_scale(args[0]))
             elif self.file_mode and op == "view":
                 if not args:
                     raise ValueError("view needs 1-6 or a view name")
@@ -2663,6 +2674,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
+_FILE_ZOOM_KEYS = frozenset({"-", "=", "_", "+", "\r", "\n"})
+
+
+def handle_key_batch(app: FatPix, term: RawTerminal, key) -> bool:
+    """Apply one event, coalescing only an adjacent buffered file-zoom run.
+
+    ``zoom_file`` updates scale and marks the grid dirty without reading it.
+    Draining the rest of an already-buffered key-repeat run here means the main
+    loop materializes only the final viewport while preserving event order at
+    the first non-zoom input.
+    """
+    coalesce_zoom = app.file_mode and not app.command_open and key in _FILE_ZOOM_KEYS
+    if not app.handle_key(key):
+        return False
+    while coalesce_zoom:
+        pending = term.read_queued_key_if(_FILE_ZOOM_KEYS)
+        if pending is None:
+            break
+        if not app.handle_key(pending):
+            return False
+    return True
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     clarity_path = resolve_clarity_path(args.clarity)
@@ -2725,7 +2759,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 key = term.read_key()
                 if key is not None:
-                    if not app.handle_key(key):
+                    if not handle_key_batch(app, term, key):
                         break
                     dirty = True
 
