@@ -32,6 +32,11 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Changed Python and native file-mode navigation to preserve cursor columns and
+  viewport phase during one-row scrolling and half-page movement.
+- Separated the native cursor footer from drag selections, corrected half-page
+  row geometry, and made inspector sizing and corner placement content-aware
+  and stable during navigation.
 - Reformatted the native viewer into conventionally indented, bounded C source
   without changing its behavior.
 - Unified native viewport classification and lens sampling into one bounded

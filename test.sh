@@ -238,6 +238,32 @@ status = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", app.render_status())
 assert "pos=0x10..0x4f" in status, status
 assert status.split("\n", 1)[1] == "? help | selected 64 B", status
 
+# Ordinary file navigation scrolls by the minimum whole row in both directions,
+# retaining the viewport's existing phase instead of recentering the cursor.
+nav = fatpix.FatPix(file_source=fatpix.ByteSource(data=bytes(range(256))), file_label="nav.bin")
+nav.w, nav.h, nav.file_bytes_per_cell = 4, 2, 2
+nav.grid = [[0] * nav.w for _ in range(nav.h)]
+nav.file_view_start, nav.file_cursor_addr = 7, 21
+nav.move_file_cursor(1, 0)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (23, 15, 0, 1)
+nav.file_cursor_addr, nav.file_view_start = 15, 15
+nav.move_file_cursor(-1, 0)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (13, 7, 3, 0)
+nav.file_cursor_addr, nav.file_view_start = 15, 7
+nav.move_file_cursor(0, 1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (23, 15, 0, 1)
+nav.move_file_cursor(0, 1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (31, 23, 0, 1)
+nav.move_file_cursor(0, -1)
+nav.move_file_cursor(0, -1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (15, 15, 0, 0)
+nav.file_cursor_addr, nav.file_view_start = 19, 7
+nav.move_file_cursor(0, 1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (27, 15, 2, 1)
+nav.file_cursor_addr = 17
+nav.move_file_cursor(0, -1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (9, 7, 1, 0)
+
 app.inspect_page = app.inspect_pages.index("STATS")
 stats = "\n".join(app.inspector_lines(100, 20))
 assert "entropy=" in stats and "zero=" in stats and "printable=" in stats, stats
@@ -323,6 +349,7 @@ int main(void) {
     char alias[128];
     unsigned char bytes[1024];
     int fd, result, panel_x, panel_y;
+    char footer[512];
 
     for (size_t i = 0; i < sizeof(bytes); i++) bytes[i] = (unsigned char)i;
     fd = mkstemp(path);
@@ -342,6 +369,13 @@ int main(void) {
     view.scale = 1; view.cell = 14; view.cursor = 128; view.inspect = 1;
     if (!display.map || !display.back || render(&display, &source, &view, &cache, 1) < 0) return 3;
     if (source.read_calls != 2) return 18; /* one viewport batch plus inspector */
+    display.measure_text = 1; display.measured_text_width = 0; display.font_scale = 1;
+    if (render_inspector(&display, &source, &view, &cache) < 0) return 24;
+    int inspector_width = display.measured_text_width;
+    display.measured_text_width = 0; display.font_scale = 2;
+    if (render_inspector(&display, &source, &view, &cache) < 0 ||
+        display.measured_text_width != inspector_width * 2) return 24;
+    display.measure_text = 0; display.font_scale = 1;
     view.selection_start = 0; view.selection_end = 16;
     if (dump_selection(&source, &view, alias) == 0) return 19;
     unlink(alias);
@@ -358,7 +392,7 @@ int main(void) {
     display.mouse_y = display.var.yres - 1;
     mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 0, 0});
     if (view.selecting) return 5;
-    view.cursor = 0;
+    view.cursor = 0; view.inspector_positioned = 0;
     inspector_position(&display, &view, &cache, 60, 40, &panel_x, &panel_y);
     if (panel_x != 72 || panel_y != 52) return 6;
     view.cursor = 49;
@@ -380,30 +414,82 @@ int main(void) {
     view.view = 0; view.scale = 2; view.cursor = 0;
     for (int step = 1; step <= 7; step++) {
         view.cursor += view.scale;
-        keep_cursor_visible(&view, 100, 8);
+        keep_cursor_visible(&view, 4, 2);
         if (view.view != 0 || (view.cursor - view.view) / view.scale != (uint64_t)step) return 11;
         if (step == 4 && ((view.cursor - view.view) / view.scale % 4 != 0 ||
                           (view.cursor - view.view) / view.scale / 4 != 1)) return 11;
     }
     view.cursor += view.scale;
-    keep_cursor_visible(&view, 100, 8);
+    keep_cursor_visible(&view, 4, 2);
     if (view.view != 8 || (view.cursor - view.view) / view.scale != 4) return 12;
     view.cursor += view.scale;
-    keep_cursor_visible(&view, 100, 8);
+    keep_cursor_visible(&view, 4, 2);
     if (view.view != 8 || (view.cursor - view.view) / view.scale != 5) return 13;
+    view.view = 7; view.scale = 2; view.cursor = 21;
+    view.cursor += view.scale; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || view.cursor != 23 || (view.cursor - view.view) / view.scale != 4) return 29;
+    view.cursor -= view.scale; view.view = 15; view.cursor = 15;
+    view.cursor -= view.scale; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 7 || view.cursor != 13 || (view.cursor - view.view) / view.scale != 3) return 29;
+    view.view = 7; view.cursor = 15;
+    view.cursor += 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || (view.cursor - view.view) / view.scale != 4) return 29;
+    view.cursor += 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 23 || (view.cursor - view.view) / view.scale != 4) return 29;
+    view.cursor -= 8; keep_cursor_visible(&view, 4, 2);
+    view.cursor -= 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || (view.cursor - view.view) / view.scale != 0) return 29;
+    view.view = 7; view.cursor = 19;
+    view.cursor += 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || (view.cursor - view.view) / view.scale % 4 != 2) return 29;
+    view.cursor = 17;
+    view.cursor -= 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 7 || (view.cursor - view.view) / view.scale % 4 != 1) return 29;
     if (zoom_scale(4, 0, 1) != 6 || zoom_scale(4, 1, 1) != 3 ||
         zoom_scale(4, 0, 4) != 12 || zoom_scale(4, 1, 4) != 1) return 14;
-    if (half_page_bytes(9, 3) != 12 || representative_start(100, 2048) != 612) return 21;
+    if (representative_start(100, 2048) != 612) return 21;
+    view.view = 0; view.cursor = 7; view.scale = 1;
+    page_cursor(&view, 10000, 10, 8, 1);
+    if (view.cursor != 47 || ((view.cursor - view.view) / view.scale) % 10 != 7) return 25;
+    page_cursor(&view, 10000, 10, 8, 1);
+    if (view.cursor != 87 || ((view.cursor - view.view) / view.scale) % 10 != 7) return 25;
+    page_cursor(&view, 10000, 10, 8, 0);
+    if (view.cursor != 47 || ((view.cursor - view.view) / view.scale) % 10 != 7) return 25;
+    view.view = 3; view.cursor = 80; view.scale = 1;
+    page_cursor(&view, 10000, 10, 8, 1);
+    if (view.cursor != 120 || view.view != 73 || (view.cursor - view.view) % 10 != 7) return 25;
+    source.path = "/tmp/sample.bin"; view.lens = 1; view.cursor = 0x8100;
+    view.scale = 1024; view.selection_start = 0x7383; view.selection_end = 0x8b83;
+    view.selection_dragged = 0; footer_status(&source, &view, footer, sizeof(footer));
+    if (!strstr(footer, "pos=0x8100") || strstr(footer, "sel=") || strstr(footer, "..")) return 26;
+    view.selection_dragged = 1; footer_status(&source, &view, footer, sizeof(footer));
+    if (!strstr(footer, "pos=0x8100  sel=0x7383..0x8b82 (6.0KiB)")) return 26;
+    view.cursor = 0x9000; footer_status(&source, &view, footer, sizeof(footer));
+    if (!strstr(footer, "pos=0x9000") || strstr(footer, "pos=0x7383")) return 26;
+    view.selection_start = 9; view.selection_end = 10;
+    footer_status(&source, &view, footer, sizeof(footer));
+    if (strstr(footer, "0x9..0x9")) return 26;
     view.help = 1; if (mouse_gestures_allowed(&view, 0)) return 23;
     view.help = 0; if (mouse_gestures_allowed(&view, 1) || !mouse_gestures_allowed(&view, 0)) return 23;
     display.var.xres = 800; display.var.yres = 600; display.font_scale = 1;
     display.mouse_x = 100; display.mouse_y = 300; display.mouse_speed = 1.0;
     source.size = 16 * 1024 * 1024; view.cell = 10; view.view = 0; view.scale = 2048;
-    view.cursor = 0; view.inspect = 1;
+    view.cursor = 0; view.inspect = 1; view.inspector_positioned = 0;
     mouse_event(&display, &view, &source, &cache, (const uint8_t[]){9, 0, 0});
+    if (view.selection_dragged) return 27;
     mouse_event(&display, &view, &source, &cache, (const uint8_t[]){9, 10, 0});
+    if (!view.selection_dragged || view.selection_end <= view.selection_start + view.scale) return 27;
     if (view.inspect_focus != representative_start(view.cursor, view.scale)) return 22;
     mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 0, 0});
+    cache.cols = 80; cache.rows = 57; view.view = 0; view.scale = 1; view.cursor = 7;
+    view.inspector_positioned = 0;
+    inspector_position(&display, &view, &cache, 200, 100, &panel_x, &panel_y);
+    int stable_x = panel_x, stable_y = panel_y;
+    for (int page = 0; page < 5; page++) {
+        view.cursor += 4 * 80;
+        inspector_position(&display, &view, &cache, 200, 100, &panel_x, &panel_y);
+        if (panel_x != stable_x || panel_y != stable_y) return 28;
+    }
     if (classify_lens(2, (const uint8_t[]){0xaa,0xaa}, 2, 0xaa, NULL, 0, NULL, 0).color != 0 ||
         classify_lens(3, (const uint8_t[]){0,255}, 2, 0, NULL, 0, NULL, 0).color != 7 ||
         lens_number("neighbor") != 5 || lens_number("d") != 3) return 15;
