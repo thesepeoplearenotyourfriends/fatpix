@@ -32,6 +32,8 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Fixed native inspector measurement for separately positioned text and added
+  cooperative Linux VT release/acquire handling with keyboard-mode restoration.
 - Changed Python and native file-mode navigation to preserve cursor columns and
   viewport phase during one-row scrolling and half-page movement.
 - Separated the native cursor footer from drag selections, corrected half-page

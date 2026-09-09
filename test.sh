@@ -375,6 +375,22 @@ int main(void) {
     display.measured_text_width = 0; display.font_scale = 2;
     if (render_inspector(&display, &source, &view, &cache) < 0 ||
         display.measured_text_width != inspector_width * 2) return 24;
+    display.font_scale = 1;
+    view.inspect_page = 0;
+    display.measured_text_width = 0;
+    if (render_inspector(&display, &source, &view, &cache) < 0) return 30;
+    int hex_panel_width = display.measured_text_width + 8;
+    cache.baseline_n = cache.inspect_n;
+    cache.baseline_scale = view.scale;
+    cache.baseline_start = cache.inspect_start;
+    memcpy(cache.baseline_data, cache.inspect_data, cache.inspect_n);
+    view.inspect_page = 6;
+    display.measured_text_width = 0;
+    if (render_inspector(&display, &source, &view, &cache) < 0) return 30;
+    int diff_hex_panel_width = display.measured_text_width + 8;
+    int rightmost_ascii_edge = 8 + (48 + 11) * 6 + 5;
+    if (diff_hex_panel_width <= rightmost_ascii_edge || diff_hex_panel_width != hex_panel_width) return 30;
+    view.inspect_page = 0;
     display.measure_text = 0; display.font_scale = 1;
     view.selection_start = 0; view.selection_end = 16;
     if (dump_selection(&source, &view, alias) == 0) return 19;
