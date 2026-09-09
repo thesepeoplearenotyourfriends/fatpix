@@ -41,6 +41,16 @@ typedef struct {
     uint64_t view, scale, cursor, selection_start, selection_end, selection_anchor;
     int cell, inspect, selecting;
 } View;
+typedef struct {
+    Cell *cells;
+    size_t count;
+    uint64_t view, scale;
+    int cols, rows, valid;
+    uint8_t inspect_data[256];
+    size_t inspect_n;
+    uint64_t inspect_start;
+    int inspect_valid;
+} RenderCache;
 
 static volatile sig_atomic_t stopping;
 static void stop_now(int sig) { (void)sig; stopping = 1; }
@@ -325,8 +335,8 @@ static void outline(Display *d,int x,int y,int cell,uint32_t color) {
     rect(d,x,y,1,cell,color);rect(d,x+cell-1,y,1,cell,color);
 }
 
-static void render_inspector(Display *d,const Source *s,const View *v) {
-    enum { PER_LINE=16, LINES=16 }; uint8_t data[PER_LINE]; char line[128];
+static int render_inspector(Display *d,const Source *s,const View *v,RenderCache *cache) {
+    enum { PER_LINE=16, LINES=16 }; char line[128];
     int panel_w=500;
     int x,y,row; uint64_t start=v->cursor&~15ULL;
     if(panel_w>(int)d->var.xres-16)panel_w=(int)d->var.xres-16;
@@ -334,23 +344,36 @@ static void render_inspector(Display *d,const Source *s,const View *v) {
     rect(d,x-2,y-2,panel_w+4,154,0xe0e0e0);rect(d,x,y,panel_w,150,0x101010);
     text5(d,x+8,y+7,"INSPECT HEX  (i/ESC CLOSE)",0xf1f1e8);
     if(start>=8ULL*PER_LINE)start-=8ULL*PER_LINE;else start=0;
+    if(!cache->inspect_valid||cache->inspect_start!=start) {
+        ssize_t got=source_read(s,cache->inspect_data,sizeof(cache->inspect_data),start);
+        if(got<0)return -1;
+        cache->inspect_start=start;cache->inspect_n=(size_t)got;cache->inspect_valid=1;
+    }
     for(row=0;row<LINES;row++) { size_t n=0,j,pos;
         uint64_t off=start+(uint64_t)row*PER_LINE;
-        ssize_t got=source_read(s,data,PER_LINE,off); if(got>0)n=(size_t)got;
+        size_t at=(size_t)row*PER_LINE;
+        if(at<cache->inspect_n){n=cache->inspect_n-at;if(n>PER_LINE)n=PER_LINE;}
         pos=(size_t)snprintf(line,sizeof(line),"%08llx ",(unsigned long long)off);
-        for(j=0;j<PER_LINE;j++)pos+=(size_t)snprintf(line+pos,sizeof(line)-pos,j<n?"%02x ":"   ",j<n?data[j]:0);
+        for(j=0;j<PER_LINE;j++)pos+=(size_t)snprintf(line+pos,sizeof(line)-pos,j<n?"%02x ":"   ",j<n?cache->inspect_data[at+j]:0);
         pos+=(size_t)snprintf(line+pos,sizeof(line)-pos," ");
-        for(j=0;j<n&&pos+1<sizeof(line);j++)line[pos++]=(data[j]>=32&&data[j]<=126)?(char)data[j]:'.';
+        for(j=0;j<n&&pos+1<sizeof(line);j++){uint8_t b=cache->inspect_data[at+j];line[pos++]=(b>=32&&b<=126)?(char)b:'.';}
         line[pos]=0;text5(d,x+8,y+21+row*8,line,off<=v->cursor&&v->cursor<off+n?0xf2d34f:0xd0d0d0);
     }
+    return 0;
 }
 
-static int render(Display *d,const Source *s,const View *v) {
+static int render(Display *d,const Source *s,const View *v,RenderCache *cache,int grid_dirty) {
     uint64_t view=v->view,scale=v->scale,cursor=v->cursor;int cell=v->cell;
     int cols=d->var.xres/cell, rows=((int)d->var.yres-22)/cell,x,y; size_t count; Cell *grid; char status[512],sc[40];
     if(cols<1||rows<1)return -1;
-    count=(size_t)cols*rows; grid=malloc(count*sizeof(*grid)); if(!grid)return -1;
-    if(make_grid(s,view,scale,count,grid)<0){free(grid);return -1;} memset(d->back,0,d->map_len);
+    count=(size_t)cols*rows;
+    if(grid_dirty||!cache->valid||cache->view!=view||cache->scale!=scale||cache->cols!=cols||cache->rows!=rows) {
+        Cell *replacement=realloc(cache->cells,count*sizeof(*replacement));if(!replacement)return -1;
+        cache->cells=replacement;
+        if(make_grid(s,view,scale,count,cache->cells)<0)return -1;
+        cache->count=count;cache->view=view;cache->scale=scale;cache->cols=cols;cache->rows=rows;cache->valid=1;
+    }
+    grid=cache->cells;memset(d->back,0,d->map_len);
     for(y=0;y<rows;y++)for(x=0;x<cols;x++){size_t i=(size_t)y*cols+x;uint64_t a=view+(uint64_t)i*scale,b=a+scale;rect(d,x*cell+1,y*cell+1,cell-2,cell-2,palette[grid[i].color]);if(v->selection_end>v->selection_start&&a<v->selection_end&&b>v->selection_start)outline(d,x*cell,y*cell,cell,0xef3e36);}
     if(cursor>=view && (cursor-view)/scale<count) { size_t i=(size_t)((cursor-view)/scale); x=(int)(i%cols)*cell;y=(int)(i/cols)*cell;outline(d,x,y,cell,0xffffff); }
     human_scale(scale,sc,sizeof(sc));
@@ -358,9 +381,9 @@ static int render(Display *d,const Source *s,const View *v) {
         snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx..0x%llx  view=literal  inspect=%s",base_name(s->path),sc,(unsigned long long)v->selection_start,(unsigned long long)(v->selection_end-1),v->inspect?"hex":"off");
     else snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx  view=literal  inspect=%s",base_name(s->path),sc,(unsigned long long)cursor,v->inspect?"hex":"off");
     rect(d,0,rows*cell,d->var.xres,d->var.yres-rows*cell,0x050505);text5(d,2,rows*cell+4,status,0xe0e0e0);
-    if(v->inspect)render_inspector(d,s,v);
+    if(v->inspect&&render_inspector(d,s,v,cache)<0)return -1;
     if(d->mouse>=0){rect(d,d->mouse_x-4,d->mouse_y,9,1,0xffffff);rect(d,d->mouse_x,d->mouse_y-4,1,9,0xffffff);}
-    memcpy(d->map,d->back,d->map_len);free(grid);return 0;
+    memcpy(d->map,d->back,d->map_len);return 0;
 }
 
 static void show_command(Display *d, int cell, const char *command, size_t n) {
@@ -394,42 +417,44 @@ static void mouse_event(Display *d,View *v,const Source *s,const uint8_t packet[
 }
 
 static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint64_t scale,uint64_t cursor) {
-    Display d; View v={0}; char in[256],command[128]; uint8_t mouse_buf[3];size_t mouse_n=0,cmdn=0; int command_mode=0,dirty=1,n,i;
+    Display d; View v={0}; RenderCache cache={0}; char in[256],command[128]; uint8_t mouse_buf[3];size_t mouse_n=0,cmdn=0; int command_mode=0,present_dirty=1,grid_dirty=1,n,i;
     v.scale=scale;v.cursor=cursor;v.cell=cell;
     stopping=0;
     if(install_signal_handlers()<0)return -1;
     if(display_open(&d,fb,mouse)<0){display_close(&d);return -1;}d.mouse_x=(int)d.var.xres/2;d.mouse_y=(int)d.var.yres/2;
     while(!stopping){int cols=d.var.xres/cell,rows=((int)d.var.yres-22)/cell;uint64_t page=(uint64_t)cols*rows*scale;
         struct pollfd fds[2]={{d.tty,POLLIN,0},{d.mouse,POLLIN,0}};
+        uint64_t old_view=v.view;
         scale=v.scale;cursor=v.cursor;if(cursor>=s->size&&s->size)cursor=s->size-1;
         if(cursor<v.view)v.view=(cursor/scale)*scale;else if(cursor>=v.view+page)v.view=((cursor/scale)-(uint64_t)cols*rows+1)*scale;v.cursor=cursor;
-        if(dirty){if(render(&d,s,&v)<0)break;dirty=0;}
+        if(v.view!=old_view)grid_dirty=1;
+        if(present_dirty||grid_dirty){if(render(&d,s,&v,&cache,grid_dirty)<0)break;present_dirty=grid_dirty=0;}
         if(poll(fds,d.mouse>=0?2:1,-1)<0){if(errno==EINTR)continue;break;}
-        if(d.mouse>=0&&(fds[1].revents&POLLIN)){uint8_t buf[48];ssize_t got=read(d.mouse,buf,sizeof(buf));ssize_t z;if(got>0)for(z=0;z<got;z++){if(!mouse_n&&!(buf[z]&8))continue;mouse_buf[mouse_n++]=buf[z];if(mouse_n==3){mouse_event(&d,&v,s,mouse_buf);mouse_n=0;dirty=1;}}}
+        if(d.mouse>=0&&(fds[1].revents&POLLIN)){uint8_t buf[48];ssize_t got=read(d.mouse,buf,sizeof(buf));ssize_t z;if(got>0)for(z=0;z<got;z++){if(!mouse_n&&!(buf[z]&8))continue;mouse_buf[mouse_n++]=buf[z];if(mouse_n==3){mouse_event(&d,&v,s,mouse_buf);mouse_n=0;present_dirty=1;}}}
         if(!(fds[0].revents&POLLIN))continue;
         n=read_key(d.tty,in,sizeof(in));if(n<0)break;
         for(i=0;i<n;i++){unsigned char k=in[i];uint64_t move=0;
             if(k==3){stopping=1;break;}
-            if(command_mode){if(k==27){command_mode=0;cmdn=0;dirty=1;}else if(k=='\r'||k=='\n'){command[cmdn]=0;
+            if(command_mode){if(k==27){command_mode=0;cmdn=0;present_dirty=1;}else if(k=='\r'||k=='\n'){command[cmdn]=0;
                     if((!strncmp(command,"g ",2)||!strncmp(command,"goto ",5))&&parse_u64(command+(command[1]==' '?2:5),0,&v.cursor)==0)cursor=v.cursor;
-                    else {uint64_t value;if((!strncmp(command,"s ",2)||!strncmp(command,"scale ",6))&&parse_u64(command+(command[1]==' '?2:6),1,&value)==0&&value)scale=v.scale=value;}
-                    command_mode=0;cmdn=0;dirty=1;
+                    else {uint64_t value;if((!strncmp(command,"s ",2)||!strncmp(command,"scale ",6))&&parse_u64(command+(command[1]==' '?2:6),1,&value)==0&&value){scale=v.scale=value;grid_dirty=1;}}
+                    command_mode=0;cmdn=0;present_dirty=1;
                 }else if((k==127||k==8)&&cmdn)cmdn--;else if(k>=32&&k<127&&cmdn+1<sizeof(command))command[cmdn++]=k;
                 if(command_mode)show_command(&d,cell,command,cmdn);
                 continue;}
             if(k==':' ){command_mode=1;cmdn=0;show_command(&d,cell,command,cmdn);continue;}
             if(k=='g'){command_mode=1;memcpy(command,"g ",2);cmdn=2;show_command(&d,cell,command,cmdn);continue;}
             if(k=='q'){stopping=1;break;}
-            if(k=='i'){v.inspect=!v.inspect;dirty=1;continue;}
+            if(k=='i'){v.inspect=!v.inspect;present_dirty=1;continue;}
             if(k=='a')move=scale>cursor?cursor:scale,cursor-=move;else if(k=='d')cursor+=scale;else if(k=='w')move=(uint64_t)cols*scale,cursor-=move>cursor?cursor:move;else if(k=='s')cursor+=(uint64_t)cols*scale;
             else if(k=='-'||k=='='){ /* Consume adjacent repeats before rendering: final scale is the request. */
-                do { if(k=='-'&&scale<=UINT64_MAX/2)scale*=2;else if(k=='='&&scale>1)scale=(scale+1)/2; if(i+1<n&&(in[i+1]=='-'||in[i+1]=='='))k=in[++i];else break; }while(1);
+                do { if(k=='-'&&scale<=UINT64_MAX/2)scale*=2;else if(k=='='&&scale>1)scale=(scale+1)/2; if(i+1<n&&(in[i+1]=='-'||in[i+1]=='='))k=in[++i];else break; }while(1);grid_dirty=1;
             } else if(k==0x1b&&i+2<n&&in[i+1]=='['){unsigned char z=in[i+2];i+=2;if(z=='A')cursor-=(uint64_t)cols*scale>cursor?cursor:(uint64_t)cols*scale;else if(z=='B')cursor+=(uint64_t)cols*scale;else if(z=='C')cursor+=scale;else if(z=='D')cursor-=scale>cursor?cursor:scale;else if((z=='5'||z=='6')&&i+1<n&&in[i+1]=='~'){uint64_t half=page/2;i++;if(z=='5')cursor-=half>cursor?cursor:half;else cursor+=half;}}
-            else if(k==27){if(v.inspect){v.inspect=0;dirty=1;continue;}if(v.selection_end>v.selection_start){v.selection_start=v.selection_end=0;dirty=1;continue;}stopping=1;break;}
-            v.cursor=cursor;v.scale=scale;dirty=1;
+            else if(k==27){if(v.inspect){v.inspect=0;present_dirty=1;continue;}if(v.selection_end>v.selection_start){v.selection_start=v.selection_end=0;present_dirty=1;continue;}stopping=1;break;}
+            v.cursor=cursor;v.scale=scale;present_dirty=1;
         }
     }
-    display_close(&d);return stopping?0:-1;
+    free(cache.cells);display_close(&d);return stopping?0:-1;
 }
 
 static void usage(FILE *f){fprintf(f,"usage: fatpix-c [--fb PATH] [--mouse PATH|--no-mouse] [--cell PX] [--scale N|10K|1.5M] [--offset N] FILE\n       fatpix-c --dump-grid WIDTHxHEIGHT [--scale N] [--offset N] FILE\n");}

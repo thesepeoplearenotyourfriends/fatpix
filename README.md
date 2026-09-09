@@ -30,6 +30,8 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Cached the native FatPix logical grid and inspector bytes so pointer,
+  selection, and in-viewport cursor redraws do not reread the file viewport.
 - Added the native FatPix hex inspector and direct mouse selection, including
   drag ranges, selection outlines, and an on-screen pointer.
 - Added a native Linux framebuffer FatPix viewer with regular-file and block-

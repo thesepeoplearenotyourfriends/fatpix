@@ -306,6 +306,51 @@ cmp "$tmp/fatpix-c-fine.grid" "$tmp/fatpix-py-fine.grid"
 cmp "$tmp/fatpix-c-coarse.grid" "$tmp/fatpix-py-coarse.grid"
 printf 'FatPix native parity: literal byte and bounded coarse grids agree\n'
 
+# Native presentation-only changes reuse the classified logical grid. Closing
+# the source after the first render makes any accidental viewport reread fail;
+# the cached inspector bytes also cover a nearby cursor-outline move.
+cat > "$tmp/fatpix-cache-test.c" <<'C'
+#define main fatpix_program_main
+#include "fatpix.c"
+#undef main
+
+int main(void) {
+    Source source;
+    Display display = {0};
+    View view = {0};
+    RenderCache cache = {0};
+    char path[] = "/tmp/fatpix-cache-XXXXXX";
+    unsigned char bytes[1024];
+    int fd, result;
+
+    for (size_t i = 0; i < sizeof(bytes); i++) bytes[i] = (unsigned char)i;
+    fd = mkstemp(path);
+    if (fd < 0 || write(fd, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes)) return 1;
+    close(fd);
+    if (source_open(&source, path) < 0) return 2;
+    unlink(path);
+    display.fd = display.tty = display.mouse = -1;
+    display.var.xres = 140; display.var.yres = 100; display.var.bits_per_pixel = 32;
+    display.var.red.length = display.var.green.length = display.var.blue.length = 8;
+    display.var.red.offset = 16; display.var.green.offset = 8;
+    display.fix.line_length = display.var.xres * 4;
+    display.map_len = (size_t)display.fix.line_length * display.var.yres;
+    display.map = calloc(1, display.map_len); display.back = calloc(1, display.map_len);
+    view.scale = 1; view.cell = 14; view.cursor = 128; view.inspect = 1;
+    if (!display.map || !display.back || render(&display, &source, &view, &cache, 1) < 0) return 3;
+
+    close(source.fd); source.fd = -1;
+    view.cursor++; view.selection_start = 128; view.selection_end = 130;
+    display.mouse_x++; display.mouse_y++;
+    result = render(&display, &source, &view, &cache, 0);
+    free(cache.cells); free(display.map); free(display.back);
+    return result < 0 ? 4 : 0;
+}
+C
+${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-cache-test.c" -lm -o "$tmp/fatpix-cache-test"
+"$tmp/fatpix-cache-test"
+printf 'FatPix native rendering: presentation changes reuse grid and inspector caches\n'
+
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
 python3 clarity.py --stats "$tmp/probe-xor.grb" > "$tmp/explicit-stats.txt"
