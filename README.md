@@ -1,3 +1,7 @@
+<img width="1128" height="639" alt="image" src="https://github.com/user-attachments/assets/b477b448-97eb-4c09-bfb5-59d0d2a746cc" />
+
+
+
 # FatPix, Clarity, and Garble
 
 Small, local tools for seeing, interpreting, and experimentally transforming
