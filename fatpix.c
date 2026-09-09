@@ -25,6 +25,8 @@
 #define SAMPLE_MAX 1024
 #define BATCH_MAX (8u * 1024u * 1024u)
 #define CELL_DEFAULT 14
+#define MOUSE_SPEED_DEFAULT 1.0
+#define FONT_SCALE_DEFAULT 2
 
 typedef struct { int fd; uint64_t size; const char *path; } Source;
 typedef struct { uint8_t color; const char *kind; } Cell;
@@ -35,7 +37,8 @@ typedef struct {
     struct fb_fix_screeninfo fix;
     uint8_t *map, *back;
     size_t map_len;
-    int mouse, mouse_x, mouse_y;
+    int mouse, mouse_x, mouse_y, font_scale;
+    double mouse_speed, mouse_remainder_x, mouse_remainder_y;
 } Display;
 typedef struct {
     uint64_t view, scale, cursor, selection_start, selection_end, selection_anchor;
@@ -291,11 +294,12 @@ static void rect(Display *d,int x,int y,int w,int h,uint32_t rgb) {
     for(yy=y;yy<y+h;yy++) for(xx=x;xx<x+w;xx++) memcpy(d->back+(size_t)yy*d->fix.line_length+(size_t)xx*bytes,&px,(size_t)bytes);
 }
 static void text5(Display *d,int x,int y,const char *s,uint32_t rgb) {
-    for(;*s;s++,x+=6) { unsigned c=(unsigned char)*s; int yy,xx; const uint8_t *glyph;
+    int size=d->font_scale>0?d->font_scale:1;
+    for(;*s;s++,x+=6*size) { unsigned c=(unsigned char)*s; int yy,xx; const uint8_t *glyph;
         if(c>='a'&&c<='z')c-=32;
         if(c<32||c>127)c='?';
         glyph=font5x7[c-32];
-        for(yy=0;yy<7;yy++)for(xx=0;xx<5;xx++)if(glyph[yy]&(1u<<(4-xx)))rect(d,x+xx,y+yy,1,1,rgb);
+        for(yy=0;yy<7;yy++)for(xx=0;xx<5;xx++)if(glyph[yy]&(1u<<(4-xx)))rect(d,x+xx*size,y+yy*size,size,size,rgb);
     }
 }
 
@@ -335,14 +339,24 @@ static void outline(Display *d,int x,int y,int cell,uint32_t color) {
     rect(d,x,y,1,cell,color);rect(d,x+cell-1,y,1,cell,color);
 }
 
+static void inspector_position(const Display *d,const View *v,const RenderCache *cache,
+                               int panel_w,int panel_h,int *x,int *y) {
+    size_t index=v->cursor>=v->view?(size_t)((v->cursor-v->view)/v->scale):0;
+    int cursor_right=v->cursor>=v->view&&(index%(size_t)cache->cols)>=(size_t)cache->cols/2;
+    int cursor_bottom=v->cursor>=v->view&&(index/(size_t)cache->cols)>=(size_t)cache->rows/2;
+    *x=cursor_right?8:(int)d->var.xres-panel_w-8;
+    *y=cursor_bottom?8:(int)d->var.yres-panel_h-8;
+}
+
 static int render_inspector(Display *d,const Source *s,const View *v,RenderCache *cache) {
     enum { PER_LINE=16, LINES=16 }; char line[128];
-    int panel_w=500;
+    int size=d->font_scale>0?d->font_scale:1,panel_w=500*size,panel_h=150*size;
     int x,y,row; uint64_t start=v->cursor&~15ULL;
     if(panel_w>(int)d->var.xres-16)panel_w=(int)d->var.xres-16;
-    x=((int)d->var.xres-panel_w)/2;y=((int)d->var.yres-154)/2;
-    rect(d,x-2,y-2,panel_w+4,154,0xe0e0e0);rect(d,x,y,panel_w,150,0x101010);
-    text5(d,x+8,y+7,"INSPECT HEX  (i/ESC CLOSE)",0xf1f1e8);
+    if(panel_h>(int)d->var.yres-16)panel_h=(int)d->var.yres-16;
+    inspector_position(d,v,cache,panel_w,panel_h,&x,&y);
+    rect(d,x-2,y-2,panel_w+4,panel_h+4,0xe0e0e0);rect(d,x,y,panel_w,panel_h,0x101010);
+    text5(d,x+8*size,y+7*size,"INSPECT HEX  (i/ESC CLOSE)",0xf1f1e8);
     if(start>=8ULL*PER_LINE)start-=8ULL*PER_LINE;else start=0;
     if(!cache->inspect_valid||cache->inspect_start!=start) {
         ssize_t got=source_read(s,cache->inspect_data,sizeof(cache->inspect_data),start);
@@ -357,14 +371,15 @@ static int render_inspector(Display *d,const Source *s,const View *v,RenderCache
         for(j=0;j<PER_LINE;j++)pos+=(size_t)snprintf(line+pos,sizeof(line)-pos,j<n?"%02x ":"   ",j<n?cache->inspect_data[at+j]:0);
         pos+=(size_t)snprintf(line+pos,sizeof(line)-pos," ");
         for(j=0;j<n&&pos+1<sizeof(line);j++){uint8_t b=cache->inspect_data[at+j];line[pos++]=(b>=32&&b<=126)?(char)b:'.';}
-        line[pos]=0;text5(d,x+8,y+21+row*8,line,off<=v->cursor&&v->cursor<off+n?0xf2d34f:0xd0d0d0);
+        line[pos]=0;text5(d,x+8*size,y+(21+row*8)*size,line,off<=v->cursor&&v->cursor<off+n?0xf2d34f:0xd0d0d0);
     }
     return 0;
 }
 
 static int render(Display *d,const Source *s,const View *v,RenderCache *cache,int grid_dirty) {
     uint64_t view=v->view,scale=v->scale,cursor=v->cursor;int cell=v->cell;
-    int cols=d->var.xres/cell, rows=((int)d->var.yres-22)/cell,x,y; size_t count; Cell *grid; char status[512],sc[40];
+    int footer=22*(d->font_scale>0?d->font_scale:1);
+    int cols=d->var.xres/cell, rows=((int)d->var.yres-footer)/cell,x,y; size_t count; Cell *grid; char status[512],sc[40];
     if(cols<1||rows<1)return -1;
     count=(size_t)cols*rows;
     if(grid_dirty||!cache->valid||cache->view!=view||cache->scale!=scale||cache->cols!=cols||cache->rows!=rows) {
@@ -380,18 +395,18 @@ static int render(Display *d,const Source *s,const View *v,RenderCache *cache,in
     if(v->selection_end>v->selection_start)
         snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx..0x%llx  view=literal  inspect=%s",base_name(s->path),sc,(unsigned long long)v->selection_start,(unsigned long long)(v->selection_end-1),v->inspect?"hex":"off");
     else snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx  view=literal  inspect=%s",base_name(s->path),sc,(unsigned long long)cursor,v->inspect?"hex":"off");
-    rect(d,0,rows*cell,d->var.xres,d->var.yres-rows*cell,0x050505);text5(d,2,rows*cell+4,status,0xe0e0e0);
+    rect(d,0,rows*cell,d->var.xres,d->var.yres-rows*cell,0x050505);text5(d,2,rows*cell+4*(d->font_scale>0?d->font_scale:1),status,0xe0e0e0);
     if(v->inspect&&render_inspector(d,s,v,cache)<0)return -1;
     if(d->mouse>=0){rect(d,d->mouse_x-4,d->mouse_y,9,1,0xffffff);rect(d,d->mouse_x,d->mouse_y-4,1,9,0xffffff);}
     memcpy(d->map,d->back,d->map_len);return 0;
 }
 
 static void show_command(Display *d, int cell, const char *command, size_t n) {
-    int rows=((int)d->var.yres-22)/cell; char line[132];
+    int size=d->font_scale>0?d->font_scale:1,rows=((int)d->var.yres-22*size)/cell; char line[132];
     if(n>sizeof(line)-2)n=sizeof(line)-2;
     line[0]=':'; memcpy(line+1,command,n); line[n+1]=0;
     rect(d,0,rows*cell,d->var.xres,d->var.yres-rows*cell,0x050505);
-    text5(d,2,rows*cell+4,line,0xe0e0e0);
+    text5(d,2,rows*cell+4*size,line,0xe0e0e0);
     memcpy(d->map,d->back,d->map_len);
 }
 
@@ -399,8 +414,11 @@ static int read_key(int fd,char *out,size_t cap) {
     ssize_t n=read(fd,out,cap); if(n<0&&errno==EINTR)return 0; return n>0?(int)n:-1;
 }
 static void mouse_event(Display *d,View *v,const Source *s,const uint8_t packet[3]) {
-    static int old_left; int left=packet[0]&1,cols=d->var.xres/v->cell,rows=((int)d->var.yres-22)/v->cell;
+    static int old_left; int size=d->font_scale>0?d->font_scale:1,left=packet[0]&1,cols=d->var.xres/v->cell,rows=((int)d->var.yres-22*size)/v->cell;
     int64_t dx=(int8_t)packet[1],dy=(int8_t)packet[2]; size_t index; uint64_t a,b;
+    double speed=d->mouse_speed>0?d->mouse_speed:1.0,scaled;
+    scaled=(double)dx*speed+d->mouse_remainder_x;dx=(int64_t)scaled;d->mouse_remainder_x=scaled-(double)dx;
+    scaled=(double)dy*speed+d->mouse_remainder_y;dy=(int64_t)scaled;d->mouse_remainder_y=scaled-(double)dy;
     d->mouse_x+=(int)dx;d->mouse_y-=(int)dy;
     if(!left)v->selecting=0;
     if(d->mouse_x<0)d->mouse_x=0;
@@ -416,13 +434,13 @@ static void mouse_event(Display *d,View *v,const Source *s,const uint8_t packet[
     old_left=left;
 }
 
-static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint64_t scale,uint64_t cursor) {
+static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint64_t scale,uint64_t cursor,double mouse_speed,int font_scale) {
     Display d; View v={0}; RenderCache cache={0}; char in[256],command[128]; uint8_t mouse_buf[3];size_t mouse_n=0,cmdn=0; int command_mode=0,present_dirty=1,grid_dirty=1,n,i;
     v.scale=scale;v.cursor=cursor;v.cell=cell;
     stopping=0;
     if(install_signal_handlers()<0)return -1;
-    if(display_open(&d,fb,mouse)<0){display_close(&d);return -1;}d.mouse_x=(int)d.var.xres/2;d.mouse_y=(int)d.var.yres/2;
-    while(!stopping){int cols=d.var.xres/cell,rows=((int)d.var.yres-22)/cell;uint64_t page=(uint64_t)cols*rows*scale;
+    if(display_open(&d,fb,mouse)<0){display_close(&d);return -1;}d.mouse_speed=mouse_speed;d.font_scale=font_scale;d.mouse_x=(int)d.var.xres/2;d.mouse_y=(int)d.var.yres/2;
+    while(!stopping){int cols=d.var.xres/cell,rows=((int)d.var.yres-22*font_scale)/cell;uint64_t page=(uint64_t)cols*rows*scale;
         struct pollfd fds[2]={{d.tty,POLLIN,0},{d.mouse,POLLIN,0}};
         uint64_t old_view=v.view;
         scale=v.scale;cursor=v.cursor;if(cursor>=s->size&&s->size)cursor=s->size-1;
@@ -457,10 +475,10 @@ static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint6
     free(cache.cells);display_close(&d);return stopping?0:-1;
 }
 
-static void usage(FILE *f){fprintf(f,"usage: fatpix-c [--fb PATH] [--mouse PATH|--no-mouse] [--cell PX] [--scale N|10K|1.5M] [--offset N] FILE\n       fatpix-c --dump-grid WIDTHxHEIGHT [--scale N] [--offset N] FILE\n");}
-int main(int argc,char **argv){const char *path=NULL,*fb="/dev/fb0",*mouse="/dev/input/mice",*dump=NULL;uint64_t scale=1,off=0;int cell=CELL_DEFAULT,i;Source s;
-    for(i=1;i<argc;i++){if(!strcmp(argv[i],"--fb")&&++i<argc)fb=argv[i];else if(!strcmp(argv[i],"--mouse")&&++i<argc)mouse=argv[i];else if(!strcmp(argv[i],"--no-mouse"))mouse=NULL;else if(!strcmp(argv[i],"--cell")&&++i<argc)cell=atoi(argv[i]);else if(!strcmp(argv[i],"--scale")&&++i<argc){if(parse_u64(argv[i],1,&scale)||!scale){fprintf(stderr,"fatpix-c: invalid scale\n");return 2;}}else if(!strcmp(argv[i],"--offset")&&++i<argc){if(parse_u64(argv[i],0,&off)){fprintf(stderr,"fatpix-c: invalid offset\n");return 2;}}else if(!strcmp(argv[i],"--dump-grid")&&++i<argc)dump=argv[i];else if(!strcmp(argv[i],"--help")){usage(stdout);return 0;}else if(argv[i][0]=='-'){usage(stderr);return 2;}else if(path){usage(stderr);return 2;}else path=argv[i];}
+static void usage(FILE *f){fprintf(f,"usage: fatpix-c [--fb PATH] [--mouse PATH|--no-mouse] [--mouse-speed N] [--font-scale N] [--cell PX] [--scale N|10K|1.5M] [--offset N] FILE\n       fatpix-c --dump-grid WIDTHxHEIGHT [--scale N] [--offset N] FILE\n");}
+int main(int argc,char **argv){const char *path=NULL,*fb="/dev/fb0",*mouse="/dev/input/mice",*dump=NULL;uint64_t scale=1,off=0;double mouse_speed=MOUSE_SPEED_DEFAULT;int font_scale=FONT_SCALE_DEFAULT,cell=CELL_DEFAULT,i;Source s;
+    for(i=1;i<argc;i++){if(!strcmp(argv[i],"--fb")&&++i<argc)fb=argv[i];else if(!strcmp(argv[i],"--mouse")&&++i<argc)mouse=argv[i];else if(!strcmp(argv[i],"--no-mouse"))mouse=NULL;else if(!strcmp(argv[i],"--mouse-speed")&&++i<argc){char *end;errno=0;mouse_speed=strtod(argv[i],&end);if(errno||end==argv[i]||*end||!isfinite(mouse_speed)||mouse_speed<=0){fprintf(stderr,"fatpix-c: invalid mouse speed\n");return 2;}}else if(!strcmp(argv[i],"--font-scale")&&++i<argc){char *end;long value;errno=0;value=strtol(argv[i],&end,10);if(errno||end==argv[i]||*end||value<1||value>16){fprintf(stderr,"fatpix-c: invalid font scale\n");return 2;}font_scale=(int)value;}else if(!strcmp(argv[i],"--cell")&&++i<argc)cell=atoi(argv[i]);else if(!strcmp(argv[i],"--scale")&&++i<argc){if(parse_u64(argv[i],1,&scale)||!scale){fprintf(stderr,"fatpix-c: invalid scale\n");return 2;}}else if(!strcmp(argv[i],"--offset")&&++i<argc){if(parse_u64(argv[i],0,&off)){fprintf(stderr,"fatpix-c: invalid offset\n");return 2;}}else if(!strcmp(argv[i],"--dump-grid")&&++i<argc)dump=argv[i];else if(!strcmp(argv[i],"--help")){usage(stdout);return 0;}else if(argv[i][0]=='-'){usage(stderr);return 2;}else if(path){usage(stderr);return 2;}else path=argv[i];}
     if(!path||cell<4){usage(stderr);return 2;}if(source_open(&s,path)<0){fprintf(stderr,"fatpix-c: %s: %s\n",path,strerror(errno));if(s.fd>=0)close(s.fd);return 1;}
     if(dump){unsigned w,h;char tail;size_t n,j;Cell *g;if(sscanf(dump,"%ux%u%c",&w,&h,&tail)!=2||!w||!h||w>10000||h>10000){fprintf(stderr,"fatpix-c: invalid grid size\n");return 2;}n=(size_t)w*h;g=malloc(n*sizeof(*g));if(!g||make_grid(&s,off,scale,n,g)<0){fprintf(stderr,"fatpix-c: grid: %s\n",strerror(errno));return 1;}for(j=0;j<n;j++){printf("%u:%s%c",g[j].color,g[j].kind,(j+1)%w?' ':'\n');}free(g);close(s.fd);return 0;}
-    i=interactive(&s,fb,mouse,cell,scale,off);if(i<0)fprintf(stderr,"fatpix-c: display failed: %s\n",strerror(errno));close(s.fd);return i<0?1:0;
+    i=interactive(&s,fb,mouse,cell,scale,off,mouse_speed,font_scale);if(i<0)fprintf(stderr,"fatpix-c: display failed: %s\n",strerror(errno));close(s.fd);return i<0?1:0;
 }

@@ -321,7 +321,7 @@ int main(void) {
     RenderCache cache = {0};
     char path[] = "/tmp/fatpix-cache-XXXXXX";
     unsigned char bytes[1024];
-    int fd, result;
+    int fd, result, panel_x, panel_y;
 
     for (size_t i = 0; i < sizeof(bytes); i++) bytes[i] = (unsigned char)i;
     fd = mkstemp(path);
@@ -347,13 +347,29 @@ int main(void) {
     display.mouse_y = display.var.yres - 1;
     mouse_event(&display, &view, &source, (const uint8_t[]){8, 0, 0});
     if (view.selecting) return 5;
+    view.cursor = 0;
+    inspector_position(&display, &view, &cache, 60, 40, &panel_x, &panel_y);
+    if (panel_x != 72 || panel_y != 52) return 6;
+    view.cursor = 49;
+    inspector_position(&display, &view, &cache, 60, 40, &panel_x, &panel_y);
+    if (panel_x != 8 || panel_y != 8) return 7;
+    display.mouse_speed = 0.5; display.mouse_x = 10; display.mouse_y = 10;
+    display.mouse_remainder_x = display.mouse_remainder_y = 0.0;
+    mouse_event(&display, &view, &source, (const uint8_t[]){8, 1, 0});
+    mouse_event(&display, &view, &source, (const uint8_t[]){8, 1, 0});
+    if (display.mouse_x != 11) return 8;
+    display.font_scale = 2; memset(display.back, 0, display.map_len);
+    text5(&display, 0, 0, "!", 0xffffff);
+    if (!((uint32_t *)display.back)[4] || !((uint32_t *)display.back)[5] ||
+        !((uint32_t *)(display.back + display.fix.line_length))[4] ||
+        ((uint32_t *)display.back)[2]) return 9;
     free(cache.cells); free(display.map); free(display.back);
     return result < 0 ? 4 : 0;
 }
 C
 ${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-cache-test.c" -lm -o "$tmp/fatpix-cache-test"
 "$tmp/fatpix-cache-test"
-printf 'FatPix native rendering: presentation changes reuse grid and inspector caches\n'
+printf 'FatPix native rendering: caches, corner inspector, mouse speed, and text scale agree\n'
 
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
