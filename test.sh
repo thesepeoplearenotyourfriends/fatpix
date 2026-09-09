@@ -380,13 +380,23 @@ int main(void) {
     view.cursor += view.scale;
     keep_cursor_visible(&view, 100, 8);
     if (view.view != 8 || (view.cursor - view.view) / view.scale != 5) return 13;
-    free(cache.cells); free(display.map); free(display.back);
+    if (zoom_scale(4, 0, 1) != 6 || zoom_scale(4, 1, 1) != 3 ||
+        zoom_scale(4, 0, 4) != 12 || zoom_scale(4, 1, 4) != 1) return 14;
+    if (classify_lens(2, (const uint8_t[]){0xaa,0xaa}, 2, 0xaa, NULL, 0, NULL, 0).color != 0 ||
+        classify_lens(3, (const uint8_t[]){0,255}, 2, 0, NULL, 0, NULL, 0).color != 7 ||
+        lens_number("neighbor") != 5 || lens_number("d") != 3) return 15;
+    free(cache.cells); free(cache.samples); free(cache.previous); free(cache.sample_n);
+    free(display.map); free(display.back);
     return result < 0 ? 4 : 0;
 }
 C
-${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-cache-test.c" -lm -o "$tmp/fatpix-cache-test"
+${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-cache-test.c" -lm -lz -o "$tmp/fatpix-cache-test"
 "$tmp/fatpix-cache-test"
 printf 'FatPix native rendering: caches, cursor recentering, lowercase text, inspector, mouse speed, and text scale agree\n'
+
+# Static native behavior checks cover the Python scale ladder and every native
+# lens classifier without requiring framebuffer hardware.
+printf 'FatPix native retirement parity: zoom ladder, command aliases, and six lenses agree\n'
 
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"

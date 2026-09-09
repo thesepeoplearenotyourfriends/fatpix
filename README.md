@@ -32,6 +32,9 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Brought the native file viewer's scale ladder, six byte lenses, exact-focus
+  inspector and seven inspector pages, command aliases, selection dumping,
+  contextual help, and two-line status behavior in line with the Python viewer.
 - Matched native cursor navigation to FatPix's stable in-viewport row wrapping
   and centered, scale-aligned viewport changes, and added lowercase native font
   glyphs.

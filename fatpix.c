@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define SAMPLE_MAX 1024
 #define BATCH_MAX (8u * 1024u * 1024u)
@@ -42,18 +43,29 @@ typedef struct {
 } Display;
 typedef struct {
     uint64_t view, scale, cursor, selection_start, selection_end, selection_anchor;
-    int cell, inspect, selecting;
+    uint64_t inspect_focus;
+    int cell, inspect, inspect_page, lens, selecting, help;
+    char message[160];
 } View;
 typedef struct {
     Cell *cells;
     size_t count;
     uint64_t view, scale;
     int cols, rows, valid;
-    uint8_t inspect_data[256];
+    uint8_t inspect_data[1024];
+    uint8_t baseline_data[1024];
     size_t inspect_n;
     uint64_t inspect_start;
     int inspect_valid;
+    uint8_t *samples, *previous;
+    uint16_t *sample_n;
+    uint64_t baseline_start, baseline_scale;
+    size_t baseline_n;
+    int baseline_valid;
 } RenderCache;
+
+static const char *lens_names[] = {"", "literal", "xor-prev", "delta-prev", "compress", "neighbor-diff", "cursor-sim"};
+static const char *page_names[] = {"HEX", "TEXT", "NUM", "MAGIC", "STATS", "RANGE", "DIFF HEX"};
 
 static volatile sig_atomic_t stopping;
 static void stop_now(int sig) { (void)sig; stopping = 1; }
@@ -259,6 +271,61 @@ static int make_grid(const Source *s, uint64_t start, uint64_t scale,
     free(batch); return 0;
 }
 
+static uint8_t scalar_color(double v) {
+    if(v<=.005)return 0;
+    if(v<.05)return 3;
+    if(v<.15)return 6;
+    if(v<.30)return 5;
+    if(v<.50)return 4;
+    if(v<.70)return 7;
+    return 2;
+}
+static uint8_t similarity_color(double v) {
+    if(v<.02)return 0;
+    if(v<.10)return 3;
+    if(v<.25)return 6;
+    if(v<.45)return 5;
+    if(v<.65)return 4;
+    if(v<.85)return 2;
+    if(v<.999)return 7;
+    return 1;
+}
+static double jsd16(const uint8_t *a,size_t an,const uint8_t *b,size_t bn) {
+    unsigned ah[16]={0},bh[16]={0};double d=0;size_t i;
+    if(!an||!bn)return 0;
+    for(i=0;i<an;i++)ah[a[i]>>4]++;
+    for(i=0;i<bn;i++)bh[b[i]>>4]++;
+    for(i=0;i<16;i++){double p=(double)ah[i]/an,q=(double)bh[i]/bn,m=(p+q)/2;
+        if(p)d+=.5*p*log2(p/m);
+        if(q)d+=.5*q*log2(q/m);}
+    return d;
+}
+static Cell classify_lens(int lens,const uint8_t *p,size_t n,uint8_t previous,
+                          const uint8_t *neighbor,size_t nn,const uint8_t *cursor,size_t cn) {
+    uint8_t tmp[SAMPLE_MAX];size_t i;double score;
+    if(!n)return (Cell){8,"eof"};
+    if(lens==1)return n==1?byte_cell(*p):summary_cell(p,n);
+    if(lens==2){for(i=0;i<n;i++){tmp[i]=p[i]^(i?p[i-1]:previous);}return n==1?byte_cell(tmp[0]):summary_cell(tmp,n);}
+    if(lens==3){double sum=0;for(i=0;i<n;i++)sum+=abs((int)p[i]-(int)(i?p[i-1]:previous));return (Cell){scalar_color(sum/n/255.0),"delta"};}
+    if(lens==4){uLongf outn=compressBound(n);uint8_t *out=malloc(outn);int ok=out&&compress2(out,&outn,p,n,1)==Z_OK;score=ok?fmin(1.0,(double)outn/n):1;free(out);return (Cell){scalar_color(score),"compress"};}
+    if(lens==5)return (Cell){scalar_color(neighbor?jsd16(p,n,neighbor,nn):0),"neighbor-diff"};
+    if(lens==6){size_t same=0,total=n>cn?n:cn;if(!total)score=0;else{size_t common=n<cn?n:cn;for(i=0;i<common;i++)same+=p[i]==cursor[i];score=(double)same/total;}return (Cell){similarity_color(score),"cursor-sim"};}
+    return summary_cell(p,n);
+}
+
+static int recolor_grid(const Source *s,const View *v,RenderCache *c) {
+    size_t i,count=c->count;uint8_t previous=0;size_t cursor_i=0;
+    uint8_t *samples=realloc(c->samples,count*SAMPLE_MAX),*prev=realloc(c->previous,count);
+    uint16_t *sizes=realloc(c->sample_n,count*sizeof(*sizes));
+    if(!samples||!prev||!sizes){free(samples);free(prev);free(sizes);return -1;}
+    c->samples=samples;c->previous=prev;c->sample_n=sizes;
+    if(v->cursor>=v->view)cursor_i=(size_t)((v->cursor-v->view)/v->scale);
+    if(cursor_i>=count)cursor_i=0;
+    for(i=0;i<count;i++){uint64_t off=v->view+(uint64_t)i*v->scale,span,at;size_t n;if(off>=s->size){sizes[i]=0;continue;}span=s->size-off;if(span>v->scale)span=v->scale;n=(size_t)(span>SAMPLE_MAX?SAMPLE_MAX:span);at=off+(span-n)/2;if(at&&source_read(s,&previous,1,at-1)!=1)return -1;else if(!at)previous=0;prev[i]=previous;if(source_read(s,samples+i*SAMPLE_MAX,n,at)!=(ssize_t)n)return -1;sizes[i]=n;}
+    for(i=0;i<count;i++)c->cells[i]=classify_lens(v->lens,c->samples+i*SAMPLE_MAX,sizes[i],prev[i],i?c->samples+(i-1)*SAMPLE_MAX:NULL,i?sizes[i-1]:0,c->samples+cursor_i*SAMPLE_MAX,sizes[cursor_i]);
+    return 0;
+}
+
 static int parse_u64(const char *text, int fractional, uint64_t *out) {
     char *end; double d; uint64_t mult=1;
     if (!fractional) {
@@ -347,34 +414,46 @@ static void inspector_position(const Display *d,const View *v,const RenderCache 
     *y=cursor_bottom?8:(int)d->var.yres-panel_h-8;
 }
 
+static uint64_t inspection_start(const Source *s,const View *v) {
+    uint64_t span=s->size-v->cursor<v->scale?s->size-v->cursor:v->scale;
+    if(v->inspect_focus<s->size)return v->inspect_focus;
+    return span>1024?v->cursor+(span-1024)/2:v->cursor;
+}
+static uint16_t le16(const uint8_t*p){return (uint16_t)p[0]|(uint16_t)p[1]<<8;}
+static uint32_t le32(const uint8_t*p){return (uint32_t)le16(p)|(uint32_t)le16(p+2)<<16;}
+static uint64_t le64(const uint8_t*p){return (uint64_t)le32(p)|(uint64_t)le32(p+4)<<32;}
+static uint16_t be16(const uint8_t*p){return (uint16_t)p[0]<<8|p[1];}
+static uint32_t be32(const uint8_t*p){return (uint32_t)be16(p)<<16|be16(p+2);}
+static uint64_t be64(const uint8_t*p){return (uint64_t)be32(p)<<32|be32(p+4);}
 static int render_inspector(Display *d,const Source *s,const View *v,RenderCache *cache) {
-    enum { PER_LINE=16, LINES=16 }; char line[128];
-    int size=d->font_scale>0?d->font_scale:1,panel_w=500*size,panel_h=150*size;
-    int x,y,row; uint64_t start=v->cursor&~15ULL;
+    char line[512];int size=d->font_scale>0?d->font_scale:1,panel_w=500*size,panel_h=150*size,x,y,row;
+    uint64_t start=inspection_start(s,v),span=s->size-v->cursor<v->scale?s->size-v->cursor:v->scale;
+    size_t want=span<256?256:(span<1024?(size_t)span:1024),n;
     if(panel_w>(int)d->var.xres-16)panel_w=(int)d->var.xres-16;
     if(panel_h>(int)d->var.yres-16)panel_h=(int)d->var.yres-16;
-    inspector_position(d,v,cache,panel_w,panel_h,&x,&y);
-    rect(d,x-2,y-2,panel_w+4,panel_h+4,0xe0e0e0);rect(d,x,y,panel_w,panel_h,0x101010);
-    text5(d,x+8*size,y+7*size,"INSPECT HEX  (i/ESC CLOSE)",0xf1f1e8);
-    if(start>=8ULL*PER_LINE)start-=8ULL*PER_LINE;else start=0;
-    if(!cache->inspect_valid||cache->inspect_start!=start) {
-        ssize_t got=source_read(s,cache->inspect_data,sizeof(cache->inspect_data),start);
-        if(got<0)return -1;
-        cache->inspect_start=start;cache->inspect_n=(size_t)got;cache->inspect_valid=1;
-    }
-    for(row=0;row<LINES;row++) { size_t n=0,j,pos;
-        uint64_t off=start+(uint64_t)row*PER_LINE;
-        size_t at=(size_t)row*PER_LINE;
-        if(at<cache->inspect_n){n=cache->inspect_n-at;if(n>PER_LINE)n=PER_LINE;}
-        pos=(size_t)snprintf(line,sizeof(line),"%08llx ",(unsigned long long)off);
-        for(j=0;j<PER_LINE;j++)pos+=(size_t)snprintf(line+pos,sizeof(line)-pos,j<n?"%02x ":"   ",j<n?cache->inspect_data[at+j]:0);
-        pos+=(size_t)snprintf(line+pos,sizeof(line)-pos," ");
-        for(j=0;j<n&&pos+1<sizeof(line);j++){uint8_t b=cache->inspect_data[at+j];line[pos++]=(b>=32&&b<=126)?(char)b:'.';}
-        line[pos]=0;text5(d,x+8*size,y+(21+row*8)*size,line,off<=v->cursor&&v->cursor<off+n?0xf2d34f:0xd0d0d0);
-    }
+    inspector_position(d,v,cache,panel_w,panel_h,&x,&y);rect(d,x-2,y-2,panel_w+4,panel_h+4,0xe0e0e0);rect(d,x,y,panel_w,panel_h,0x101010);
+    snprintf(line,sizeof(line),"INSPECT %s %d/7  (,/. PAGE i/ESC CLOSE)",page_names[v->inspect_page],v->inspect_page+1);text5(d,x+8*size,y+7*size,line,0xf1f1e8);
+    if(!cache->inspect_valid||cache->inspect_start!=start){ssize_t got=source_read(s,cache->inspect_data,want,start);if(got<0)return -1;cache->inspect_start=start;cache->inspect_n=(size_t)got;cache->inspect_valid=1;}n=cache->inspect_n;
+#define LINE(...) do{snprintf(line,sizeof(line),__VA_ARGS__);text5(d,x+8*size,y+(21+row++*8)*size,line,0xd0d0d0);}while(0)
+    row=0;
+    if(v->inspect_page==0||v->inspect_page==6){size_t off,j,changed=0;if(v->inspect_page==6&&cache->baseline_n&&cache->baseline_scale==v->scale){size_t common=n<cache->baseline_n?n:cache->baseline_n;for(j=0;j<common;j++)changed+=cache->inspect_data[j]!=cache->baseline_data[j];changed+=n>common?n-common:cache->baseline_n-common;LINE("current 0x%llx vs previous 0x%llx; changed %zu/%zuB",(unsigned long long)start,(unsigned long long)cache->baseline_start,changed,n>cache->baseline_n?n:cache->baseline_n);}else LINE("%s %zuB; data starts 0x%llx",span<256?"context":"sample",n,(unsigned long long)start);for(off=0;off<n&&row<16;off+=12){size_t pos=snprintf(line,sizeof(line),"%08llx  ",(unsigned long long)(start+off));for(j=0;j<12;j++)pos+=snprintf(line+pos,sizeof(line)-pos,off+j<n?"%02x ":"   ",off+j<n?cache->inspect_data[off+j]:0);pos+=snprintf(line+pos,sizeof(line)-pos," |");for(j=0;j<12&&off+j<n;j++){uint8_t q=cache->inspect_data[off+j];line[pos++]=q>=32&&q<=126?q:'.';}line[pos++]='|';line[pos]=0;text5(d,x+8*size,y+(21+row++*8)*size,line,0xd0d0d0);}}
+    else if(v->inspect_page==1){size_t i,j;LINE("printable runs in sample @ 0x%llx",(unsigned long long)start);for(i=0;i<n&&row<16;i=j+1){for(;i<n&&!(cache->inspect_data[i]==9||(cache->inspect_data[i]>=32&&cache->inspect_data[i]<=126));i++);for(j=i;j<n&&(cache->inspect_data[j]==9||(cache->inspect_data[j]>=32&&cache->inspect_data[j]<=126));j++);if(j-i>=4){size_t z=snprintf(line,sizeof(line),"+0x%04zx 0x%08llx  '",i,(unsigned long long)(start+i)),k;for(k=i;k<j&&z+5<sizeof(line);k++)line[z++]=cache->inspect_data[k]==9?' ':cache->inspect_data[k];line[z++]='\'';line[z]=0;text5(d,x+8*size,y+(21+row++*8)*size,line,0xd0d0d0);}}if(row==1)LINE("no ASCII runs >= 4 bytes");}
+    else if(v->inspect_page==2){size_t rel=v->cursor>=start&&v->cursor<start+n?(size_t)(v->cursor-start):0;uint8_t*q=cache->inspect_data+rel;size_t z=n-rel;LINE("anchor=0x%llx",(unsigned long long)(start+rel));if(z)LINE("u8=%u i8=%d",q[0],(int8_t)q[0]);if(z>=2){LINE("u16 le=%u be=%u",le16(q),be16(q));LINE("i16 le=%d be=%d",(int16_t)le16(q),(int16_t)be16(q));}if(z>=4){LINE("u32 le=%u be=%u",le32(q),be32(q));LINE("i32 le=%d be=%d",(int32_t)le32(q),(int32_t)be32(q));}if(z>=8)LINE("u64 le=%llu be=%llu",(unsigned long long)le64(q),(unsigned long long)be64(q));}
+    else if(v->inspect_page==3){static const struct{const char*s;size_t n;const char*l;}m[]={{"%PDF-",5,"PDF header"},{"\x89PNG\r\n\x1a\n",8,"PNG signature"},{"\x7f""ELF",4,"ELF header"},{"PK\x03\x04",4,"ZIP local header"},{"\x1f\x8b\x08",3,"gzip header"},{"SQLite format 3",15,"SQLite header"},{"RIFF",4,"RIFF header"},{"ID3",3,"ID3 header"},{"\xff\xd8\xff",3,"JPEG header"}};size_t i,j,h=0;LINE("cheap signature scan in sample @ 0x%llx",(unsigned long long)start);for(i=0;i<sizeof(m)/sizeof(*m);i++)for(j=0;j+m[i].n<=n;j++)if(!memcmp(cache->inspect_data+j,m[i].s,m[i].n)){LINE("0x%08llx  %s",(unsigned long long)(start+j),m[i].l);h++;}if(!h)LINE("no known signatures in sampled bytes");}
+    else if(v->inspect_page==4){unsigned hist[256]={0},unique=0;size_t i,zero=0,ff=0,pr=0;double ent=0;for(i=0;i<n;i++){uint8_t q=cache->inspect_data[i];hist[q]++;zero+=q==0;ff+=q==255;pr+=q==9||q==10||q==13||(q>=32&&q<=126);}for(i=0;i<256;i++)if(hist[i]){double q=(double)hist[i]/n;unique++;ent-=q*log2(q);}LINE("cell=%lluB sample=%zuB @ 0x%llx",(unsigned long long)span,n,(unsigned long long)start);LINE("entropy=%.3f bits/B unique=%u",ent,unique);LINE("zero=%.2f%% ff=%.2f%% printable=%.2f%%",n?100.0*zero/n:0,n?100.0*ff/n:0,n?100.0*pr/n:0);LINE("lens=%d:%s",v->lens,lens_names[v->lens]);}
+    else {LINE("cell 0x%llx..0x%llx (%lluB)",(unsigned long long)v->cursor,(unsigned long long)(v->cursor+span),(unsigned long long)span);LINE("sample 0x%llx..0x%llx (%zuB)",(unsigned long long)start,(unsigned long long)(start+n),n);LINE("cursor=0x%llx",(unsigned long long)v->cursor);LINE("scale=%lluB/cell row=%lluB",(unsigned long long)v->scale,(unsigned long long)(v->scale*cache->cols));LINE("source size=%lluB",(unsigned long long)s->size);}
+#undef LINE
     return 0;
 }
-
+static void render_help(Display*d,const View*v){static const char*general[]={
+ "FATPIX FILE VIEW - BYTES AS FAT PIXELS","ARROWS/WASD MOVE | PGUP/PGDN HALF-PAGE",
+ "-/= ZOOM | _/+ LARGE ZOOM | G GOTO | : COMMAND","1-6 LITERAL/XOR/DELTA/COMPRESS/DIFF/SIMILAR",
+ "I INSPECT | ,/. PAGE | MOUSE CLICK/DRAG SELECT","COMMANDS GOTO|G SCALE|S VIEW DUMP","? OR ESC RETURN | Q QUIT"};
+ static const char*inspect[]={"FATPIX INSPECTOR HELP","I/ESC CLOSE | ,/. PREV/NEXT PAGE",
+ "HEX TEXT NUM MAGIC STATS RANGE DIFF HEX","NAVIGATION MOVES THE UNDERLYING EXACT CURSOR",
+ "ZOOM PRESERVES THE INSPECTED BYTE LOCUS","MOUSE SELECTS CONTIGUOUS CELL RANGES","? OR ESC RETURN | Q QUIT"};
+ const char**lines=v->inspect?inspect:general;size_t i;int size=d->font_scale>0?d->font_scale:1;
+ rect(d,0,0,d->var.xres,d->var.yres,0x050505);for(i=0;i<7;i++)text5(d,8*size,(int)(8+i*12)*size,lines[i],i?0xd0d0d0:0xf2d34f);}
 static int render(Display *d,const Source *s,const View *v,RenderCache *cache,int grid_dirty) {
     uint64_t view=v->view,scale=v->scale,cursor=v->cursor;int cell=v->cell;
     int footer=22*(d->font_scale>0?d->font_scale:1);
@@ -386,16 +465,18 @@ static int render(Display *d,const Source *s,const View *v,RenderCache *cache,in
         cache->cells=replacement;
         if(make_grid(s,view,scale,count,cache->cells)<0)return -1;
         cache->count=count;cache->view=view;cache->scale=scale;cache->cols=cols;cache->rows=rows;cache->valid=1;
+        if(v->lens!=1&&recolor_grid(s,v,cache)<0)return -1;
     }
     grid=cache->cells;memset(d->back,0,d->map_len);
     for(y=0;y<rows;y++)for(x=0;x<cols;x++){size_t i=(size_t)y*cols+x;uint64_t a=view+(uint64_t)i*scale,b=a+scale;rect(d,x*cell+1,y*cell+1,cell-2,cell-2,palette[grid[i].color]);if(v->selection_end>v->selection_start&&a<v->selection_end&&b>v->selection_start)outline(d,x*cell,y*cell,cell,0xef3e36);}
     if(cursor>=view && (cursor-view)/scale<count) { size_t i=(size_t)((cursor-view)/scale); x=(int)(i%cols)*cell;y=(int)(i/cols)*cell;outline(d,x,y,cell,0xffffff); }
     human_scale(scale,sc,sizeof(sc));
     if(v->selection_end>v->selection_start)
-        snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx..0x%llx  view=literal  inspect=%s",base_name(s->path),sc,(unsigned long long)v->selection_start,(unsigned long long)(v->selection_end-1),v->inspect?"hex":"off");
-    else snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx  view=literal  inspect=%s",base_name(s->path),sc,(unsigned long long)cursor,v->inspect?"hex":"off");
-    rect(d,0,rows*cell,d->var.xres,d->var.yres-rows*cell,0x050505);text5(d,2,rows*cell+4*(d->font_scale>0?d->font_scale:1),status,0xe0e0e0);
+        snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx..0x%llx  view=%s",base_name(s->path),sc,(unsigned long long)v->selection_start,(unsigned long long)(v->selection_end-1),lens_names[v->lens]);
+    else snprintf(status,sizeof(status),"file=%s  scale=%s  pos=0x%llx  view=%s",base_name(s->path),sc,(unsigned long long)cursor,lens_names[v->lens]);
+    rect(d,0,rows*cell,d->var.xres,d->var.yres-rows*cell,0x050505);text5(d,2,rows*cell+2*(d->font_scale>0?d->font_scale:1),status,0xe0e0e0);text5(d,2,rows*cell+11*(d->font_scale>0?d->font_scale:1),v->message[0]?v->message:"? help",0xe0e0e0);
     if(v->inspect&&render_inspector(d,s,v,cache)<0)return -1;
+    if(v->help)render_help(d,v);
     if(d->mouse>=0){rect(d,d->mouse_x-4,d->mouse_y,9,1,0xffffff);rect(d,d->mouse_x,d->mouse_y-4,1,9,0xffffff);}
     memcpy(d->map,d->back,d->map_len);return 0;
 }
@@ -441,14 +522,34 @@ static void mouse_event(Display *d,View *v,const Source *s,const uint8_t packet[
     index=(size_t)(d->mouse_y/v->cell)*cols+(size_t)(d->mouse_x/v->cell);
     if(index>UINT64_MAX/v->scale){old_left=left;return;}a=v->view+(uint64_t)index*v->scale;
     if(a>=s->size){old_left=left;return;}b=a+v->scale;if(b<a||b>s->size)b=s->size;
-    if(left&&!old_left){v->selection_anchor=a;v->selection_start=a;v->selection_end=b;v->cursor=a;v->selecting=1;}
+    if(left&&!old_left){v->selection_anchor=a;v->selection_start=a;v->selection_end=b;v->cursor=a;if(v->inspect)v->inspect_focus=b-a>1024?a+(b-a-1024)/2:a;v->selecting=1;}
     else if(left&&v->selecting){uint64_t anchor_end=v->selection_anchor+v->scale;if(anchor_end<v->selection_anchor||anchor_end>s->size)anchor_end=s->size;v->selection_start=a<v->selection_anchor?a:v->selection_anchor;v->selection_end=b>anchor_end?b:anchor_end;v->cursor=a;}
     old_left=left;
 }
 
+static const uint64_t small_scales[]={1,2,3,4,6,8,10,12,16,24,32,48,64,96,128,192,256,384,512,768};
+static uint64_t zoom_scale(uint64_t old,int inward,int steps){uint64_t ladder[140];size_t n=0,i,pos;uint64_t p;
+    for(i=0;i<sizeof(small_scales)/sizeof(*small_scales);i++)ladder[n++]=small_scales[i];
+    for(p=1024;p<=(1ULL<<50);p<<=1){ladder[n++]=p;if(p+p/2<=(1ULL<<50))ladder[n++]=p+p/2;}
+    for(pos=0;pos<n&&ladder[pos]<old;pos++);
+    if(inward){while(steps--&&pos)pos--;return ladder[pos];}
+    if(pos<n&&ladder[pos]<=old)pos++;
+    while(--steps>0&&pos+1<n)pos++;
+    return pos<n?ladder[pos]:old;
+}
+static int dump_selection(const Source*s,const View*v,const char*name){uint8_t buf[1024*1024];uint64_t at=v->selection_start,left=v->selection_end-v->selection_start;int fd;
+    if(!left){errno=EINVAL;return -1;}fd=open(name,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0666);if(fd<0)return -1;while(left){size_t want=left>sizeof(buf)?sizeof(buf):(size_t)left;ssize_t n=source_read(s,buf,want,at);if(n<=0||write(fd,buf,(size_t)n)!=n){close(fd);return -1;}at+=(uint64_t)n;left-=(uint64_t)n;}return close(fd);}
+static int lens_number(const char*t){int found=0,i;if(t[0]>='1'&&t[0]<='6'&&!t[1])return t[0]-'0';for(i=1;i<=6;i++)if(!strncmp(lens_names[i],t,strlen(t))){if(found)return 0;found=i;}return found;}
+static int run_file_command(const Source*s,View*v,char*cmd){char *arg,*op=cmd;uint64_t value;int lens;while(*op==' ')op++;arg=strchr(op,' ');if(arg){*arg++=0;while(*arg==' ')arg++;}
+    if((!strcmp(op,"g")||!strcmp(op,"goto"))&&arg&&parse_u64(arg,0,&value)==0&&value<s->size){v->cursor=value;v->inspect_focus=value;snprintf(v->message,sizeof(v->message),"goto 0x%llx",(unsigned long long)value);return 2;}
+    if((!strcmp(op,"s")||!strcmp(op,"scale"))&&arg&&parse_u64(arg,1,&value)==0&&value){v->scale=value;snprintf(v->message,sizeof(v->message),"scale %lluB/cell",(unsigned long long)value);return 2;}
+    if(!strcmp(op,"view")&&arg&&(lens=lens_number(arg))){v->lens=lens;snprintf(v->message,sizeof(v->message),"view %d: %s",lens,lens_names[lens]);return 1;}
+    if(!strcmp(op,"dump")&&arg){if(!strcmp(arg,s->path)){snprintf(v->message,sizeof(v->message),"command error: refusing to overwrite source");return 0;}if(dump_selection(s,v,arg)<0)snprintf(v->message,sizeof(v->message),"command error: %s",strerror(errno));else snprintf(v->message,sizeof(v->message),"dumped selection");return 0;}
+    snprintf(v->message,sizeof(v->message),"command error: invalid command or argument");return 0;}
+
 static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint64_t scale,uint64_t cursor,double mouse_speed,int font_scale) {
     Display d; View v={0}; RenderCache cache={0}; char in[256],command[128]; uint8_t mouse_buf[3];size_t mouse_n=0,cmdn=0; int command_mode=0,present_dirty=1,grid_dirty=1,n,i;
-    v.scale=scale;v.cursor=cursor;v.cell=cell;
+    v.scale=scale;v.cursor=cursor;v.cell=cell;v.lens=1;v.inspect_focus=UINT64_MAX;
     stopping=0;
     if(install_signal_handlers()<0)return -1;
     if(display_open(&d,fb,mouse)<0){display_close(&d);return -1;}d.mouse_speed=mouse_speed;d.font_scale=font_scale;d.mouse_x=(int)d.var.xres/2;d.mouse_y=(int)d.var.yres/2;
@@ -463,11 +564,12 @@ static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint6
         if(d.mouse>=0&&(fds[1].revents&POLLIN)){uint8_t buf[48];ssize_t got=read(d.mouse,buf,sizeof(buf));ssize_t z;if(got>0)for(z=0;z<got;z++){if(!mouse_n&&!(buf[z]&8))continue;mouse_buf[mouse_n++]=buf[z];if(mouse_n==3){mouse_event(&d,&v,s,mouse_buf);mouse_n=0;present_dirty=1;}}}
         if(!(fds[0].revents&POLLIN))continue;
         n=read_key(d.tty,in,sizeof(in));if(n<0)break;
-        for(i=0;i<n;i++){unsigned char k=in[i];uint64_t move=0;
+        for(i=0;i<n;i++){unsigned char k=in[i];uint64_t move=0,old_cursor=cursor;
             if(k==3){stopping=1;break;}
+            if(v.help){if(k=='q'){stopping=1;break;}if(k=='?'||k==27){v.help=0;present_dirty=1;}continue;}
+            if(k=='?'){v.help=1;present_dirty=1;continue;}
             if(command_mode){if(k==27){command_mode=0;cmdn=0;present_dirty=1;}else if(k=='\r'||k=='\n'){command[cmdn]=0;
-                    if((!strncmp(command,"g ",2)||!strncmp(command,"goto ",5))&&parse_u64(command+(command[1]==' '?2:5),0,&v.cursor)==0)cursor=v.cursor;
-                    else {uint64_t value;if((!strncmp(command,"s ",2)||!strncmp(command,"scale ",6))&&parse_u64(command+(command[1]==' '?2:6),1,&value)==0&&value){scale=v.scale=value;grid_dirty=1;}}
+                    {int changed=run_file_command(s,&v,command);cursor=v.cursor;scale=v.scale;if(changed)grid_dirty=1;}
                     command_mode=0;cmdn=0;present_dirty=1;
                 }else if((k==127||k==8)&&cmdn)cmdn--;else if(k>=32&&k<127&&cmdn+1<sizeof(command))command[cmdn++]=k;
                 if(command_mode)show_command(&d,cell,command,cmdn);
@@ -475,16 +577,17 @@ static int interactive(Source *s,const char *fb,const char *mouse,int cell,uint6
             if(k==':' ){command_mode=1;cmdn=0;show_command(&d,cell,command,cmdn);continue;}
             if(k=='g'){command_mode=1;memcpy(command,"g ",2);cmdn=2;show_command(&d,cell,command,cmdn);continue;}
             if(k=='q'){stopping=1;break;}
-            if(k=='i'){v.inspect=!v.inspect;present_dirty=1;continue;}
+            if(k=='i'){v.inspect=!v.inspect;v.inspect_focus=v.inspect?v.cursor:UINT64_MAX;cache.inspect_valid=0;snprintf(v.message,sizeof(v.message),"inspector %s",v.inspect?"open":"closed");present_dirty=1;continue;}
+            if(v.inspect&&(k==','||k=='<'||k=='.'||k=='>')){v.inspect_page=(v.inspect_page+(k==','||k=='<'?6:1))%7;snprintf(v.message,sizeof(v.message),"inspect %s",page_names[v.inspect_page]);present_dirty=1;continue;}
+            if(k>='1'&&k<='6'){v.lens=k-'0';grid_dirty=1;snprintf(v.message,sizeof(v.message),"view %d: %s",v.lens,lens_names[v.lens]);continue;}
             if(k=='a')move=scale>cursor?cursor:scale,cursor-=move;else if(k=='d')cursor+=scale;else if(k=='w')move=(uint64_t)cols*scale,cursor-=move>cursor?cursor:move;else if(k=='s')cursor+=(uint64_t)cols*scale;
-            else if(k=='-'||k=='='){ /* Consume adjacent repeats before rendering: final scale is the request. */
-                do { if(k=='-'&&scale<=UINT64_MAX/2)scale*=2;else if(k=='='&&scale>1)scale=(scale+1)/2; if(i+1<n&&(in[i+1]=='-'||in[i+1]=='='))k=in[++i];else break; }while(1);grid_dirty=1;
+            else if(k=='-'||k=='='||k=='_'||k=='+'){int inward=k=='='||k=='+',steps=k=='_'||k=='+'?4:1;uint64_t old=scale;if(v.inspect&&v.inspect_focus<s->size)cursor=v.inspect_focus;scale=zoom_scale(scale,inward,steps);v.scale=scale;v.cursor=cursor;cache.inspect_valid=0;grid_dirty=1;snprintf(v.message,sizeof(v.message),scale==old?"already at zoom limit":"scale %lluB/cell",(unsigned long long)scale);
             } else if(k==0x1b&&i+2<n&&in[i+1]=='['){unsigned char z=in[i+2];i+=2;if(z=='A')cursor-=(uint64_t)cols*scale>cursor?cursor:(uint64_t)cols*scale;else if(z=='B')cursor+=(uint64_t)cols*scale;else if(z=='C')cursor+=scale;else if(z=='D')cursor-=scale>cursor?cursor:scale;else if((z=='5'||z=='6')&&i+1<n&&in[i+1]=='~'){uint64_t half=page/2;i++;if(z=='5')cursor-=half>cursor?cursor:half;else cursor+=half;}}
-            else if(k==27){if(v.inspect){v.inspect=0;present_dirty=1;continue;}if(v.selection_end>v.selection_start){v.selection_start=v.selection_end=0;present_dirty=1;continue;}stopping=1;break;}
-            v.cursor=cursor;v.scale=scale;present_dirty=1;
+            else if(k==27){if(v.inspect){v.inspect=0;v.inspect_focus=UINT64_MAX;present_dirty=1;continue;}if(v.selection_end>v.selection_start){v.selection_start=v.selection_end=0;snprintf(v.message,sizeof(v.message),"selection cleared");present_dirty=1;continue;}stopping=1;break;}
+            v.cursor=cursor;v.scale=scale;if(v.inspect&&cursor!=old_cursor&&cache.inspect_valid){memcpy(cache.baseline_data,cache.inspect_data,cache.inspect_n);cache.baseline_n=cache.inspect_n;cache.baseline_start=cache.inspect_start;cache.baseline_scale=v.scale;}if(v.inspect&&v.inspect_focus<s->size&&cursor!=old_cursor){int64_t delta=cursor>=old_cursor?(int64_t)(cursor-old_cursor):-(int64_t)(old_cursor-cursor);if(delta<0&&(uint64_t)(-delta)>v.inspect_focus)v.inspect_focus=0;else v.inspect_focus=(uint64_t)((int64_t)v.inspect_focus+delta);if(v.inspect_focus>=s->size&&s->size)v.inspect_focus=s->size-1;cache.inspect_valid=0;}if(v.lens==6&&cursor!=old_cursor)grid_dirty=1;present_dirty=1;
         }
     }
-    free(cache.cells);display_close(&d);return stopping?0:-1;
+    free(cache.cells);free(cache.samples);free(cache.previous);free(cache.sample_n);display_close(&d);return stopping?0:-1;
 }
 
 static void usage(FILE *f){fprintf(f,"usage: fatpix-c [--fb PATH] [--mouse PATH|--no-mouse] [--mouse-speed N] [--font-scale N] [--cell PX] [--scale N|10K|1.5M] [--offset N] FILE\n       fatpix-c --dump-grid WIDTHxHEIGHT [--scale N] [--offset N] FILE\n");}
