@@ -11,12 +11,14 @@ with `./fatpix-c FILE`. It writes directly to `/dev/fb0` (override with
 `--fb PATH`) and uses no window-system or terminal UI library. Arrow keys or
 WASD move, Page Up/Down move half a viewport, `-`/`=` zoom, `g` prompts for an
 offset, `:g OFFSET` and `:s SCALE` provide direct navigation, and `q` exits.
-Press `i` for a centered hex/ASCII inspector around the cursor; `i` or Escape
-closes it. A mouse available through `/dev/input/mice` gets a framebuffer
+Press `i` for a hex/ASCII inspector in the corner opposite the cursor; `i` or
+Escape closes it. A mouse available through `/dev/input/mice` gets a framebuffer
 crosshair: click selects one fat-pixel byte range and drag extends a contiguous
 selection. Use `--mouse PATH` for another compatible PS/2 packet device or
-`--no-mouse` for keyboard-only operation. Scale values accept binary suffixes
-such as `10K` and `1.5M`.
+`--no-mouse` for keyboard-only operation. `--mouse-speed N` applies a fractional
+or whole-number motion multiplier, and `--font-scale N` changes the integer
+scale of all built-in text. Scale values accept binary suffixes such as `10K`
+and `1.5M`.
 
 For framebuffer-independent inspection and parity testing, both implementations
 can emit literal classifications:
@@ -30,6 +32,9 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Moved the native inspector between screen corners to avoid the selected cell,
+  added configurable mouse-motion speed, and made all native text globally
+  scalable.
 - Ended native mouse drags when the button is released outside the data grid.
 - Cached the native FatPix logical grid and inspector bytes so pointer,
   selection, and in-viewport cursor redraws do not reread the file viewport.
