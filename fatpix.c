@@ -1628,6 +1628,111 @@ static int dump_selection(const Source *s, const View *v, const char *name) {
     }
     return close(fd);
 }
+
+static void put_le16(uint8_t *p, uint16_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static void put_le32(uint8_t *p, uint32_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+    p[2] = (uint8_t)(value >> 16);
+    p[3] = (uint8_t)(value >> 24);
+}
+
+static uint8_t pixel_channel(uint32_t pixel, const struct fb_bitfield *field) {
+    uint64_t mask, value;
+
+    if (!field->length) {
+        return 0;
+    }
+    mask = field->length >= 32 ? UINT32_MAX : (1ULL << field->length) - 1;
+    value = ((uint64_t)pixel >> field->offset) & mask;
+    return (uint8_t)((value * 255 + mask / 2) / mask);
+}
+
+static int write_all(int fd, const void *data, size_t size) {
+    const uint8_t *p = data;
+
+    while (size) {
+        ssize_t written = write(fd, p, size);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (!written) {
+            errno = EIO;
+            return -1;
+        }
+        p += written;
+        size -= (size_t)written;
+    }
+    return 0;
+}
+
+static int save_screenshot(const Display *d, const char *path) {
+    uint8_t header[54] = {0};
+    uint8_t *row;
+    uint64_t pixel_bytes = (uint64_t)d->var.xres * d->var.yres * 4;
+    uint64_t file_size = sizeof(header) + pixel_bytes;
+    int fd;
+    uint32_t y;
+
+    if (!d->var.xres || !d->var.yres || file_size > UINT32_MAX ||
+        d->fix.line_length < (uint64_t)d->var.xres * 4) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    row = malloc((size_t)d->var.xres * 4);
+    if (!row) {
+        return -1;
+    }
+    header[0] = 'B';
+    header[1] = 'M';
+    put_le32(header + 2, (uint32_t)file_size);
+    put_le32(header + 10, sizeof(header));
+    put_le32(header + 14, 40);
+    put_le32(header + 18, d->var.xres);
+    put_le32(header + 22, d->var.yres);
+    put_le16(header + 26, 1);
+    put_le16(header + 28, 32);
+    put_le32(header + 34, (uint32_t)pixel_bytes);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0 || write_all(fd, header, sizeof(header)) < 0) {
+        int saved_errno = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        free(row);
+        errno = saved_errno;
+        return -1;
+    }
+    for (y = d->var.yres; y-- > 0;) {
+        uint32_t x;
+        const uint8_t *source_row = d->back + (size_t)y * d->fix.line_length;
+        for (x = 0; x < d->var.xres; x++) {
+            uint32_t pixel;
+            memcpy(&pixel, source_row + (size_t)x * 4, sizeof(pixel));
+            row[x * 4] = pixel_channel(pixel, &d->var.blue);
+            row[x * 4 + 1] = pixel_channel(pixel, &d->var.green);
+            row[x * 4 + 2] = pixel_channel(pixel, &d->var.red);
+            row[x * 4 + 3] = 255;
+        }
+        if (write_all(fd, row, (size_t)d->var.xres * 4) < 0) {
+            int saved_errno = errno;
+            close(fd);
+            free(row);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    free(row);
+    return close(fd);
+}
+
 static int lens_number(const char *t) {
     int found = 0, i;
     if (t[0] >= '1' && t[0] <= '6' && !t[1]) {
@@ -1696,6 +1801,9 @@ static int run_file_command(const Source *s, View *v, char *cmd) {
         }
         return 0;
     }
+    if (!strcmp(op, "screenshot") && !arg) {
+        return 3;
+    }
     snprintf(v->message, sizeof(v->message), "command error: invalid command or argument");
     return 0;
 }
@@ -1710,7 +1818,7 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     char in[256], command[128];
     uint8_t mouse_buf[3];
     size_t mouse_n = 0, cmdn = 0;
-    int command_mode = 0, present_dirty = 1, grid_dirty = 1, n, i;
+    int command_mode = 0, screenshot_pending = 0, present_dirty = 1, grid_dirty = 1, n, i;
     v.scale = scale;
     v.cursor = cursor;
     v.cell = cell;
@@ -1754,6 +1862,17 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                 break;
             }
             present_dirty = grid_dirty = 0;
+            if (screenshot_pending) {
+                const char *path = "/tmp/fatpix-screenshot.bmp";
+                if (save_screenshot(&d, path) < 0) {
+                    snprintf(v.message, sizeof(v.message), "screenshot error: %s", strerror(errno));
+                } else {
+                    snprintf(v.message, sizeof(v.message), "saved screenshot: %s", path);
+                }
+                screenshot_pending = 0;
+                present_dirty = 1;
+                continue;
+            }
         }
         if (poll(fds, 3, -1) < 0) {
             if (errno == EINTR) {
@@ -1850,6 +1969,9 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                         }
                         if (changed == 2) {
                             grid_dirty = 1;
+                        }
+                        if (changed == 3) {
+                            screenshot_pending = 1;
                         }
                     }
                     command_mode = 0;
