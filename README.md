@@ -19,6 +19,8 @@ selection. Use `--mouse PATH` for another compatible PS/2 packet device or
 or whole-number motion multiplier, and `--font-scale N` changes the integer
 scale of all built-in text. Scale values accept binary suffixes such as `10K`
 and `1.5M`.
+The native-only `:screenshot` command overwrites
+`/tmp/fatpix-screenshot.bmp` with the current view.
 
 For framebuffer-independent inspection and parity testing, both implementations
 can emit literal classifications:
@@ -32,6 +34,10 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Added native `:screenshot` output to `/tmp/fatpix-screenshot.bmp`.
+- Made Linux VT release/acquire signals reliably wake the native event loop.
+- Fixed native inspector measurement for separately positioned text and added
+  cooperative Linux VT release/acquire handling with keyboard-mode restoration.
 - Changed Python and native file-mode navigation to preserve cursor columns and
   viewport phase during one-row scrolling and half-page movement.
 - Separated the native cursor footer from drag selections, corrected half-page

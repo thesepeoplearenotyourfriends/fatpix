@@ -375,6 +375,22 @@ int main(void) {
     display.measured_text_width = 0; display.font_scale = 2;
     if (render_inspector(&display, &source, &view, &cache) < 0 ||
         display.measured_text_width != inspector_width * 2) return 24;
+    display.font_scale = 1;
+    view.inspect_page = 0;
+    display.measured_text_width = 0;
+    if (render_inspector(&display, &source, &view, &cache) < 0) return 30;
+    int hex_panel_width = display.measured_text_width + 8;
+    cache.baseline_n = cache.inspect_n;
+    cache.baseline_scale = view.scale;
+    cache.baseline_start = cache.inspect_start;
+    memcpy(cache.baseline_data, cache.inspect_data, cache.inspect_n);
+    view.inspect_page = 6;
+    display.measured_text_width = 0;
+    if (render_inspector(&display, &source, &view, &cache) < 0) return 30;
+    int diff_hex_panel_width = display.measured_text_width + 8;
+    int rightmost_ascii_edge = 8 + (48 + 11) * 6 + 5;
+    if (diff_hex_panel_width <= rightmost_ascii_edge || diff_hex_panel_width != hex_panel_width) return 30;
+    view.inspect_page = 0;
     display.measure_text = 0; display.font_scale = 1;
     view.selection_start = 0; view.selection_end = 16;
     if (dump_selection(&source, &view, alias) == 0) return 19;
@@ -511,13 +527,49 @@ int main(void) {
         Source commands = {.size = 4096, .path = "/tmp/source"};
         View a = {.scale = 1, .inspect_focus = UINT64_MAX}, b = a;
         char g1[] = "g 0x321", g2[] = "goto 0x321", s1[] = "s 1.5K", s2[] = "scale 1.5K";
-        char named[] = "view neighbor";
+        char named[] = "view neighbor", screenshot[] = "screenshot";
         if (run_file_command(&commands, &a, g1) != 2 || run_file_command(&commands, &b, g2) != 2 ||
             a.cursor != b.cursor || run_file_command(&commands, &a, s1) != 2 ||
             run_file_command(&commands, &b, s2) != 2 || a.scale != b.scale ||
-            run_file_command(&commands, &a, named) != 1 || a.lens != 5) return 16;
+            run_file_command(&commands, &a, named) != 1 || a.lens != 5 ||
+            run_file_command(&commands, &a, screenshot) != 3) return 16;
         a.cursor = 700; a.scale = 10; a.view = 0; center_view(&a, 4096, 80);
         if (a.view != 300) return 17;
+    }
+    {
+        struct pollfd wake = {0};
+        vt_release_requested = 0;
+        if (open_signal_wake_pipe() < 0) return 31;
+        wake.fd = signal_wake_pipe[0];
+        wake.events = POLLIN;
+        request_vt_release(SIGUSR1);
+        if (!vt_release_requested || poll(&wake, 1, 0) != 1 || !(wake.revents & POLLIN)) return 31;
+        drain_signal_wake_pipe();
+        wake.revents = 0;
+        if (poll(&wake, 1, 0) != 0) return 31;
+        close_signal_wake_pipe();
+        vt_release_requested = 0;
+    }
+    {
+        Display shot = {0};
+        uint8_t back[24] = {0}, bmp[70];
+        uint32_t pixels[] = {0x000000ff, 0x0000ff00, 0x00ff0000, 0x00ffffff};
+        struct stat info;
+        int bmp_fd;
+        shot.var.xres = 2; shot.var.yres = 2;
+        shot.var.red.offset = 0; shot.var.green.offset = 8; shot.var.blue.offset = 16;
+        shot.var.red.length = shot.var.green.length = shot.var.blue.length = 8;
+        shot.fix.line_length = 12; shot.back = back;
+        memcpy(back, pixels, 8); memcpy(back + 12, pixels + 2, 8);
+        if (save_screenshot(&shot, "/tmp/fatpix-screenshot.bmp") < 0 ||
+            stat("/tmp/fatpix-screenshot.bmp", &info) < 0 || info.st_size != 70) return 32;
+        bmp_fd = open("/tmp/fatpix-screenshot.bmp", O_RDONLY);
+        if (bmp_fd < 0 || read(bmp_fd, bmp, sizeof(bmp)) != (ssize_t)sizeof(bmp)) return 32;
+        close(bmp_fd); unlink("/tmp/fatpix-screenshot.bmp");
+        if (memcmp(bmp, "BM", 2) || le32(bmp + 2) != 70 || le32(bmp + 10) != 54 ||
+            le32(bmp + 18) != 2 || le32(bmp + 22) != 2 || le16(bmp + 28) != 32 ||
+            memcmp(bmp + 54, (const uint8_t[]){255,0,0,255, 255,255,255,255,
+                                               0,0,255,255, 0,255,0,255}, 16)) return 32;
     }
     free(cache.cells); free(cache.literal_cells); free(cache.samples); free(cache.contexts); free(cache.previous); free(cache.sample_n); free(cache.context_n);
     free(display.map); free(display.back);

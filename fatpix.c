@@ -10,6 +10,7 @@
 #include <linux/fb.h>
 #include <linux/fs.h>
 #include <linux/kd.h>
+#include <linux/vt.h>
 #include <math.h>
 #include <poll.h>
 #include <signal.h>
@@ -41,6 +42,8 @@ typedef struct {
 } Cell;
 typedef struct {
     int fd, tty, kd_mode, raw, mapped;
+    int keyboard_mode, keyboard_mode_saved, vt_mode_saved, vt_process, active;
+    struct vt_mode saved_vt_mode;
     struct termios saved_termios;
     struct fb_var_screeninfo var;
     struct fb_fix_screeninfo fix;
@@ -80,21 +83,97 @@ static const char *lens_names[] = {"",         "literal",       "xor-prev",  "de
                                    "compress", "neighbor-diff", "cursor-sim"};
 static const char *page_names[] = {"HEX", "TEXT", "NUM", "MAGIC", "STATS", "RANGE", "DIFF HEX"};
 
-static volatile sig_atomic_t stopping;
+static volatile sig_atomic_t stopping, vt_release_requested, vt_acquire_requested;
+static int signal_wake_pipe[2] = {-1, -1};
+
+static void wake_event_loop(void) {
+    int saved_errno = errno;
+    uint8_t byte = 1;
+
+    if (signal_wake_pipe[1] >= 0) {
+        ssize_t written = write(signal_wake_pipe[1], &byte, sizeof(byte));
+        (void)written;
+    }
+    errno = saved_errno;
+}
+
 static void stop_now(int sig) {
     (void)sig;
     stopping = 1;
+    wake_event_loop();
+}
+
+static void request_vt_release(int sig) {
+    (void)sig;
+    vt_release_requested = 1;
+    wake_event_loop();
+}
+
+static void request_vt_acquire(int sig) {
+    (void)sig;
+    vt_acquire_requested = 1;
+    wake_event_loop();
+}
+
+static int open_signal_wake_pipe(void) {
+    int i;
+
+    if (pipe(signal_wake_pipe) < 0) {
+        return -1;
+    }
+    for (i = 0; i < 2; i++) {
+        int flags = fcntl(signal_wake_pipe[i], F_GETFL);
+        int fd_flags = fcntl(signal_wake_pipe[i], F_GETFD);
+        if (flags < 0 || fd_flags < 0 || fcntl(signal_wake_pipe[i], F_SETFL, flags | O_NONBLOCK) < 0 ||
+            fcntl(signal_wake_pipe[i], F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            close(signal_wake_pipe[0]);
+            close(signal_wake_pipe[1]);
+            signal_wake_pipe[0] = signal_wake_pipe[1] = -1;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void close_signal_wake_pipe(void) {
+    if (signal_wake_pipe[0] >= 0) {
+        close(signal_wake_pipe[0]);
+    }
+    if (signal_wake_pipe[1] >= 0) {
+        close(signal_wake_pipe[1]);
+    }
+    signal_wake_pipe[0] = signal_wake_pipe[1] = -1;
+}
+
+static void drain_signal_wake_pipe(void) {
+    uint8_t bytes[64];
+
+    while (read(signal_wake_pipe[0], bytes, sizeof(bytes)) > 0) {
+        ;
+    }
 }
 
 static int install_signal_handlers(void) {
     struct sigaction action;
+
+    if (open_signal_wake_pipe() < 0) {
+        return -1;
+    }
     memset(&action, 0, sizeof(action));
     action.sa_handler = stop_now;
     sigemptyset(&action.sa_mask);
-    /* Deliberately omit SA_RESTART: an idle blocking read must wake so the VT
-     * and termios state are restored without waiting for another keypress. */
+    /* Deliberately omit SA_RESTART as a fallback; the self-pipe is the reliable
+     * wakeup path around the flag-check/poll boundary. */
     if (sigaction(SIGINT, &action, NULL) < 0 || sigaction(SIGTERM, &action, NULL) < 0 ||
         sigaction(SIGHUP, &action, NULL) < 0) {
+        return -1;
+    }
+    action.sa_handler = request_vt_release;
+    if (sigaction(SIGUSR1, &action, NULL) < 0) {
+        return -1;
+    }
+    action.sa_handler = request_vt_acquire;
+    if (sigaction(SIGUSR2, &action, NULL) < 0) {
         return -1;
     }
     return 0;
@@ -617,8 +696,9 @@ static void text5(Display *d, int x, int y, const char *s, uint32_t rgb) {
     int size = d->font_scale > 0 ? d->font_scale : 1;
     int width = *s ? (int)strlen(s) * 6 * size - size : 0;
     if (d->measure_text) {
-        if (width > d->measured_text_width) {
-            d->measured_text_width = width;
+        int right = x + width;
+        if (right > d->measured_text_width) {
+            d->measured_text_width = right;
         }
         return;
     }
@@ -642,8 +722,15 @@ static void text5(Display *d, int x, int y, const char *s, uint32_t rgb) {
 
 static void display_close(Display *d) {
     if (d->tty >= 0) {
+        if (d->vt_process && d->vt_mode_saved) {
+            ioctl(d->tty, VT_SETMODE, &d->saved_vt_mode);
+            d->vt_process = 0;
+        }
         if (d->raw) {
             tcsetattr(d->tty, TCSAFLUSH, &d->saved_termios);
+        }
+        if (d->keyboard_mode_saved) {
+            ioctl(d->tty, KDSKBMODE, d->keyboard_mode);
         }
         if (d->kd_mode >= 0) {
             ioctl(d->tty, KDSETMODE, d->kd_mode);
@@ -665,6 +752,7 @@ static void display_close(Display *d) {
 }
 static int display_open(Display *d, const char *fb, const char *mouse) {
     struct termios raw;
+    struct vt_mode process_mode;
     memset(d, 0, sizeof(*d));
     d->fd = d->tty = d->kd_mode = d->mouse = -1;
     d->tty = open("/dev/tty", O_RDWR | O_CLOEXEC);
@@ -676,6 +764,32 @@ static int display_open(Display *d, const char *fb, const char *mouse) {
         fprintf(stderr, "fatpix-c: controlling terminal is not a Linux VT: %s\n", strerror(errno));
         return -1;
     }
+    if (ioctl(d->tty, KDGKBMODE, &d->keyboard_mode) < 0) {
+        fprintf(stderr, "fatpix-c: cannot inspect Linux VT keyboard mode: %s\n", strerror(errno));
+        return -1;
+    }
+    d->keyboard_mode_saved = 1;
+    if ((d->keyboard_mode == K_RAW || d->keyboard_mode == K_MEDIUMRAW) &&
+        ioctl(d->tty, KDSKBMODE, K_XLATE) < 0) {
+        fprintf(stderr, "fatpix-c: cannot enable kernel VT-switch keys: %s\n", strerror(errno));
+        return -1;
+    }
+    if (ioctl(d->tty, VT_GETMODE, &d->saved_vt_mode) < 0) {
+        fprintf(stderr, "fatpix-c: cannot read Linux VT switching mode: %s\n", strerror(errno));
+        return -1;
+    }
+    d->vt_mode_saved = 1;
+    process_mode = d->saved_vt_mode;
+    process_mode.mode = VT_PROCESS;
+    process_mode.relsig = SIGUSR1;
+    process_mode.acqsig = SIGUSR2;
+    process_mode.frsig = 0;
+    if (ioctl(d->tty, VT_SETMODE, &process_mode) < 0) {
+        fprintf(stderr, "fatpix-c: cannot enable Linux VT process switching: %s\n", strerror(errno));
+        return -1;
+    }
+    d->vt_process = 1;
+    d->active = 1;
     if (tcgetattr(d->tty, &d->saved_termios) < 0) {
         return -1;
     }
@@ -803,7 +917,7 @@ static int render_inspector(Display *d, const Source *s, View *v, RenderCache *c
             return -1;
         }
         d->measure_text = 0;
-        panel_w = d->measured_text_width + 16 * size;
+        panel_w = d->measured_text_width + 8 * size;
         if (panel_w > (int)d->var.xres - 16) {
             panel_w = (int)d->var.xres - 16;
         }
@@ -870,6 +984,7 @@ static int render_inspector(Display *d, const Source *s, View *v, RenderCache *c
                 char one[4];
                 snprintf(line, sizeof(line), "%08llx", (unsigned long long)(start + off));
                 text5(d, x + 8 * size, ly, line, 0xd0d0d0);
+                text5(d, x + (8 + 47 * 6) * size, ly, "|", 0xd0d0d0);
                 for (j = 0; j < 12 && off + j < n; j++) {
                     uint32_t color = off + j >= cache->baseline_n ||
                                              cache->inspect_data[off + j] != cache->baseline_data[off + j]
@@ -883,6 +998,7 @@ static int render_inspector(Display *d, const Source *s, View *v, RenderCache *c
                     one[1] = 0;
                     text5(d, x + (8 + 48 * 6 + (int)j * 6) * size, ly, one, color);
                 }
+                text5(d, x + (8 + 60 * 6) * size, ly, "|", 0xd0d0d0);
             } else {
                 text5(d, x + 8 * size, y + (21 + row++ * 8) * size, line, 0xd0d0d0);
             }
@@ -1242,7 +1358,9 @@ static int render(Display *d, const Source *s, View *v, RenderCache *cache, int 
         rect(d, d->mouse_x - 4, d->mouse_y, 9, 1, 0xffffff);
         rect(d, d->mouse_x, d->mouse_y - 4, 1, 9, 0xffffff);
     }
-    memcpy(d->map, d->back, d->map_len);
+    if (d->active) {
+        memcpy(d->map, d->back, d->map_len);
+    }
     return 0;
 }
 
@@ -1257,7 +1375,30 @@ static void show_command(Display *d, int cell, const char *command, size_t n) {
     line[n + 1] = 0;
     rect(d, 0, rows * cell, d->var.xres, d->var.yres - rows * cell, 0x050505);
     text5(d, 2, rows * cell + 4 * size, line, 0xe0e0e0);
-    memcpy(d->map, d->back, d->map_len);
+    if (d->active) {
+        memcpy(d->map, d->back, d->map_len);
+    }
+}
+
+static int handle_vt_requests(Display *d, int *present_dirty) {
+    if (vt_release_requested) {
+        vt_release_requested = 0;
+        d->active = 0;
+        if (ioctl(d->tty, VT_RELDISP, 1) < 0) {
+            fprintf(stderr, "fatpix-c: cannot release Linux VT: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+    if (vt_acquire_requested) {
+        vt_acquire_requested = 0;
+        if (ioctl(d->tty, VT_RELDISP, VT_ACKACQ) < 0) {
+            fprintf(stderr, "fatpix-c: cannot acknowledge Linux VT acquire: %s\n", strerror(errno));
+            return -1;
+        }
+        d->active = 1;
+        *present_dirty = 1;
+    }
+    return 0;
 }
 
 static int read_key(int fd, char *out, size_t cap) {
@@ -1487,6 +1628,111 @@ static int dump_selection(const Source *s, const View *v, const char *name) {
     }
     return close(fd);
 }
+
+static void put_le16(uint8_t *p, uint16_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
+static void put_le32(uint8_t *p, uint32_t value) {
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+    p[2] = (uint8_t)(value >> 16);
+    p[3] = (uint8_t)(value >> 24);
+}
+
+static uint8_t pixel_channel(uint32_t pixel, const struct fb_bitfield *field) {
+    uint64_t mask, value;
+
+    if (!field->length) {
+        return 0;
+    }
+    mask = field->length >= 32 ? UINT32_MAX : (1ULL << field->length) - 1;
+    value = ((uint64_t)pixel >> field->offset) & mask;
+    return (uint8_t)((value * 255 + mask / 2) / mask);
+}
+
+static int write_all(int fd, const void *data, size_t size) {
+    const uint8_t *p = data;
+
+    while (size) {
+        ssize_t written = write(fd, p, size);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (!written) {
+            errno = EIO;
+            return -1;
+        }
+        p += written;
+        size -= (size_t)written;
+    }
+    return 0;
+}
+
+static int save_screenshot(const Display *d, const char *path) {
+    uint8_t header[54] = {0};
+    uint8_t *row;
+    uint64_t pixel_bytes = (uint64_t)d->var.xres * d->var.yres * 4;
+    uint64_t file_size = sizeof(header) + pixel_bytes;
+    int fd;
+    uint32_t y;
+
+    if (!d->var.xres || !d->var.yres || file_size > UINT32_MAX ||
+        d->fix.line_length < (uint64_t)d->var.xres * 4) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    row = malloc((size_t)d->var.xres * 4);
+    if (!row) {
+        return -1;
+    }
+    header[0] = 'B';
+    header[1] = 'M';
+    put_le32(header + 2, (uint32_t)file_size);
+    put_le32(header + 10, sizeof(header));
+    put_le32(header + 14, 40);
+    put_le32(header + 18, d->var.xres);
+    put_le32(header + 22, d->var.yres);
+    put_le16(header + 26, 1);
+    put_le16(header + 28, 32);
+    put_le32(header + 34, (uint32_t)pixel_bytes);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0 || write_all(fd, header, sizeof(header)) < 0) {
+        int saved_errno = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        free(row);
+        errno = saved_errno;
+        return -1;
+    }
+    for (y = d->var.yres; y-- > 0;) {
+        uint32_t x;
+        const uint8_t *source_row = d->back + (size_t)y * d->fix.line_length;
+        for (x = 0; x < d->var.xres; x++) {
+            uint32_t pixel;
+            memcpy(&pixel, source_row + (size_t)x * 4, sizeof(pixel));
+            row[x * 4] = pixel_channel(pixel, &d->var.blue);
+            row[x * 4 + 1] = pixel_channel(pixel, &d->var.green);
+            row[x * 4 + 2] = pixel_channel(pixel, &d->var.red);
+            row[x * 4 + 3] = 255;
+        }
+        if (write_all(fd, row, (size_t)d->var.xres * 4) < 0) {
+            int saved_errno = errno;
+            close(fd);
+            free(row);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    free(row);
+    return close(fd);
+}
+
 static int lens_number(const char *t) {
     int found = 0, i;
     if (t[0] >= '1' && t[0] <= '6' && !t[1]) {
@@ -1555,6 +1801,9 @@ static int run_file_command(const Source *s, View *v, char *cmd) {
         }
         return 0;
     }
+    if (!strcmp(op, "screenshot") && !arg) {
+        return 3;
+    }
     snprintf(v->message, sizeof(v->message), "command error: invalid command or argument");
     return 0;
 }
@@ -1569,18 +1818,21 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     char in[256], command[128];
     uint8_t mouse_buf[3];
     size_t mouse_n = 0, cmdn = 0;
-    int command_mode = 0, present_dirty = 1, grid_dirty = 1, n, i;
+    int command_mode = 0, screenshot_pending = 0, present_dirty = 1, grid_dirty = 1, n, i;
     v.scale = scale;
     v.cursor = cursor;
     v.cell = cell;
     v.lens = 1;
     v.inspect_focus = UINT64_MAX;
     stopping = 0;
+    vt_release_requested = vt_acquire_requested = 0;
     if (install_signal_handlers() < 0) {
+        close_signal_wake_pipe();
         return -1;
     }
     if (display_open(&d, fb, mouse) < 0) {
         display_close(&d);
+        close_signal_wake_pipe();
         return -1;
     }
     d.mouse_speed = mouse_speed;
@@ -1589,8 +1841,12 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     d.mouse_y = (int)d.var.yres / 2;
     while (!stopping) {
         int cols = d.var.xres / cell, rows = ((int)d.var.yres - 22 * font_scale) / cell;
-        struct pollfd fds[2] = {{d.tty, POLLIN, 0}, {d.mouse, POLLIN, 0}};
+        struct pollfd fds[3] = {
+            {d.tty, POLLIN, 0}, {d.mouse, POLLIN, 0}, {signal_wake_pipe[0], POLLIN, 0}};
         uint64_t old_view = v.view;
+        if (handle_vt_requests(&d, &present_dirty) < 0) {
+            break;
+        }
         scale = v.scale;
         cursor = v.cursor;
         if (cursor >= s->size && s->size) {
@@ -1601,23 +1857,44 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
         if (v.view != old_view) {
             grid_dirty = 1;
         }
-        if (present_dirty || grid_dirty) {
+        if (d.active && (present_dirty || grid_dirty)) {
             if (render(&d, s, &v, &cache, grid_dirty) < 0) {
                 break;
             }
             present_dirty = grid_dirty = 0;
+            if (screenshot_pending) {
+                const char *path = "/tmp/fatpix-screenshot.bmp";
+                if (save_screenshot(&d, path) < 0) {
+                    snprintf(v.message, sizeof(v.message), "screenshot error: %s", strerror(errno));
+                } else {
+                    snprintf(v.message, sizeof(v.message), "saved screenshot: %s", path);
+                }
+                screenshot_pending = 0;
+                present_dirty = 1;
+                continue;
+            }
         }
-        if (poll(fds, d.mouse >= 0 ? 2 : 1, -1) < 0) {
+        if (poll(fds, 3, -1) < 0) {
             if (errno == EINTR) {
                 continue;
             }
             break;
         }
+        if (fds[2].revents & POLLIN) {
+            drain_signal_wake_pipe();
+            if (handle_vt_requests(&d, &present_dirty) < 0) {
+                break;
+            }
+            if (stopping || !d.active) {
+                mouse_n = 0;
+                continue;
+            }
+        }
         if (d.mouse >= 0 && (fds[1].revents & POLLIN)) {
             uint8_t buf[48];
             ssize_t got = read(d.mouse, buf, sizeof(buf));
             ssize_t z;
-            if (got > 0) {
+            if (got > 0 && d.active) {
                 for (z = 0; z < got; z++) {
                     if (!mouse_n && !(buf[z] & 8)) {
                         continue;
@@ -1632,6 +1909,12 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                     }
                 }
             }
+            if (!d.active) {
+                mouse_n = 0;
+            }
+        }
+        if (!d.active) {
+            continue;
         }
         if (!(fds[0].revents & POLLIN)) {
             continue;
@@ -1686,6 +1969,9 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                         }
                         if (changed == 2) {
                             grid_dirty = 1;
+                        }
+                        if (changed == 3) {
+                            screenshot_pending = 1;
                         }
                     }
                     command_mode = 0;
@@ -1830,6 +2116,7 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     free(cache.sample_n);
     free(cache.context_n);
     display_close(&d);
+    close_signal_wake_pipe();
     return stopping ? 0 : -1;
 }
 
