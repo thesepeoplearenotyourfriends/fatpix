@@ -1116,7 +1116,7 @@ class FatPix:
         self.file_view_start = max(0, start)
         self.file_dirty = True
 
-    def move_file_cursor_bytes(self, delta: int) -> None:
+    def move_file_cursor_bytes(self, delta: int, scroll: bool = True) -> None:
         assert self.file_source is not None
         old_addr = self.file_cursor_addr
         new_addr = clamp(old_addr + delta, 0, max(0, self.file_source.size - 1))
@@ -1127,9 +1127,19 @@ class FatPix:
                 # the map cursor, preserving its position inside coarse cells.
                 self._set_inspect_focus(self.inspect_focus_addr + (new_addr - old_addr))
         self.file_cursor_addr = new_addr
-        viewport_end = self.file_view_start + self.w * self.h * self.file_bytes_per_cell
-        if self.file_cursor_addr < self.file_view_start or self.file_cursor_addr >= viewport_end:
-            self.center_file_on_cursor()
+        if not scroll:
+            return
+        row_bytes = self.w * self.file_bytes_per_cell
+        viewport_end = self.file_view_start + self.h * row_bytes
+        if self.file_cursor_addr < self.file_view_start:
+            rows = (self.file_view_start - self.file_cursor_addr + row_bytes - 1) // row_bytes
+            self.file_view_start = max(0, self.file_view_start - rows * row_bytes)
+            self.file_dirty = True
+            self.refresh_file_grid()
+        elif self.file_cursor_addr >= viewport_end:
+            rows = (self.file_cursor_addr - viewport_end) // row_bytes + 1
+            self.file_view_start += rows * row_bytes
+            self.file_dirty = True
             self.refresh_file_grid()
         else:
             self.sync_file_cursor_to_screen()
@@ -1662,13 +1672,25 @@ class FatPix:
     def jump_file_cursor_half_page(self, direction: int) -> None:
         if not self.file_mode:
             return
-        # Move by half the currently visible logical cells.  Keeping the jump
-        # cell-aligned preserves an exact cursor's within-cell position while
-        # leaving roughly half the old view on screen as an orientation anchor.
-        half_cells = max(1, (self.w * self.h) // 2)
-        delta = half_cells * self.file_bytes_per_cell
+        half_rows = max(1, self.h // 2)
+        delta = half_rows * self.w * self.file_bytes_per_cell
         before = self.file_cursor_addr
-        self.move_file_cursor_bytes(delta if direction > 0 else -delta)
+        old_column = (
+            (self.file_cursor_addr - self.file_view_start) // self.file_bytes_per_cell
+        ) % self.w
+        self.move_file_cursor_bytes(delta if direction > 0 else -delta, scroll=False)
+        viewport_end = self.file_view_start + self.w * self.h * self.file_bytes_per_cell
+        if self.file_cursor_addr < self.file_view_start or self.file_cursor_addr >= viewport_end:
+            target_cell = half_rows * self.w + old_column
+            self.file_view_start = max(
+                0, self.file_cursor_addr - target_cell * self.file_bytes_per_cell
+            )
+            self.file_dirty = True
+            self.refresh_file_grid()
+        else:
+            self.sync_file_cursor_to_screen()
+            if self.file_lens == 6:
+                self.recolor_file_grid()
         moved = abs(self.file_cursor_addr - before)
         if moved:
             name = "down" if direction > 0 else "up"

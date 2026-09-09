@@ -32,6 +32,8 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Changed Python and native file-mode arrow navigation to scroll only one row
+  when crossing a viewport edge, preserving cursor columns and viewport phase.
 - Separated the native cursor footer from drag selections, corrected half-page
   row geometry, and made inspector sizing and corner placement content-aware
   and stable during navigation.

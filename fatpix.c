@@ -1267,22 +1267,25 @@ static int read_key(int fd, char *out, size_t cap) {
     }
     return n > 0 ? (int)n : -1;
 }
-static void keep_cursor_visible(View *v, uint64_t source_size, uint64_t cells) {
-    uint64_t page, half, start, max_start, viewport_end;
-    if (!v->scale || !cells) {
+static void keep_cursor_visible(View *v, int cols, int rows) {
+    uint64_t row, page, viewport_end, scroll_rows;
+
+    if (!v->scale || cols < 1 || rows < 1) {
         return;
     }
-    page = cells > UINT64_MAX / v->scale ? UINT64_MAX : cells * v->scale;
+    row = (uint64_t)cols > UINT64_MAX / v->scale ? UINT64_MAX : (uint64_t)cols * v->scale;
+    page = (uint64_t)rows > UINT64_MAX / row ? UINT64_MAX : (uint64_t)rows * row;
     viewport_end = v->view > UINT64_MAX - page ? UINT64_MAX : v->view + page;
     if (v->cursor >= v->view && v->cursor < viewport_end) {
         return;
     }
-    half = (cells / 2) > UINT64_MAX / v->scale ? UINT64_MAX : (cells / 2) * v->scale;
-    start = v->cursor > half ? v->cursor - half : 0;
-    start = (start / v->scale) * v->scale;
-    max_start = source_size > page ? source_size - page : 0;
-    max_start = (max_start / v->scale) * v->scale;
-    v->view = start > max_start ? max_start : start;
+    if (v->cursor < v->view) {
+        scroll_rows = (v->view - v->cursor + row - 1) / row;
+        v->view -= scroll_rows > v->view / row ? v->view : scroll_rows * row;
+    } else {
+        scroll_rows = (v->cursor - viewport_end) / row + 1;
+        v->view = scroll_rows > (UINT64_MAX - v->view) / row ? UINT64_MAX : v->view + scroll_rows * row;
+    }
 }
 static void center_view(View *v, uint64_t source_size, uint64_t cells) {
     uint64_t page = cells > UINT64_MAX / v->scale ? UINT64_MAX : cells * v->scale;
@@ -1594,7 +1597,7 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
             cursor = s->size - 1;
         }
         v.cursor = cursor;
-        keep_cursor_visible(&v, s->size, (uint64_t)cols * rows);
+        keep_cursor_visible(&v, cols, rows);
         if (v.view != old_view) {
             grid_dirty = 1;
         }

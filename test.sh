@@ -238,6 +238,32 @@ status = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", app.render_status())
 assert "pos=0x10..0x4f" in status, status
 assert status.split("\n", 1)[1] == "? help | selected 64 B", status
 
+# Ordinary file navigation scrolls by the minimum whole row in both directions,
+# retaining the viewport's existing phase instead of recentering the cursor.
+nav = fatpix.FatPix(file_source=fatpix.ByteSource(data=bytes(range(256))), file_label="nav.bin")
+nav.w, nav.h, nav.file_bytes_per_cell = 4, 2, 2
+nav.grid = [[0] * nav.w for _ in range(nav.h)]
+nav.file_view_start, nav.file_cursor_addr = 7, 21
+nav.move_file_cursor(1, 0)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (23, 15, 0, 1)
+nav.file_cursor_addr, nav.file_view_start = 15, 15
+nav.move_file_cursor(-1, 0)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (13, 7, 3, 0)
+nav.file_cursor_addr, nav.file_view_start = 15, 7
+nav.move_file_cursor(0, 1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (23, 15, 0, 1)
+nav.move_file_cursor(0, 1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (31, 23, 0, 1)
+nav.move_file_cursor(0, -1)
+nav.move_file_cursor(0, -1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (15, 15, 0, 0)
+nav.file_cursor_addr, nav.file_view_start = 19, 7
+nav.move_file_cursor(0, 1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (27, 15, 2, 1)
+nav.file_cursor_addr = 17
+nav.move_file_cursor(0, -1)
+assert (nav.file_cursor_addr, nav.file_view_start, nav.cursor_x, nav.cursor_y) == (9, 7, 1, 0)
+
 app.inspect_page = app.inspect_pages.index("STATS")
 stats = "\n".join(app.inspector_lines(100, 20))
 assert "entropy=" in stats and "zero=" in stats and "printable=" in stats, stats
@@ -388,17 +414,37 @@ int main(void) {
     view.view = 0; view.scale = 2; view.cursor = 0;
     for (int step = 1; step <= 7; step++) {
         view.cursor += view.scale;
-        keep_cursor_visible(&view, 100, 8);
+        keep_cursor_visible(&view, 4, 2);
         if (view.view != 0 || (view.cursor - view.view) / view.scale != (uint64_t)step) return 11;
         if (step == 4 && ((view.cursor - view.view) / view.scale % 4 != 0 ||
                           (view.cursor - view.view) / view.scale / 4 != 1)) return 11;
     }
     view.cursor += view.scale;
-    keep_cursor_visible(&view, 100, 8);
+    keep_cursor_visible(&view, 4, 2);
     if (view.view != 8 || (view.cursor - view.view) / view.scale != 4) return 12;
     view.cursor += view.scale;
-    keep_cursor_visible(&view, 100, 8);
+    keep_cursor_visible(&view, 4, 2);
     if (view.view != 8 || (view.cursor - view.view) / view.scale != 5) return 13;
+    view.view = 7; view.scale = 2; view.cursor = 21;
+    view.cursor += view.scale; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || view.cursor != 23 || (view.cursor - view.view) / view.scale != 4) return 29;
+    view.cursor -= view.scale; view.view = 15; view.cursor = 15;
+    view.cursor -= view.scale; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 7 || view.cursor != 13 || (view.cursor - view.view) / view.scale != 3) return 29;
+    view.view = 7; view.cursor = 15;
+    view.cursor += 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || (view.cursor - view.view) / view.scale != 4) return 29;
+    view.cursor += 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 23 || (view.cursor - view.view) / view.scale != 4) return 29;
+    view.cursor -= 8; keep_cursor_visible(&view, 4, 2);
+    view.cursor -= 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || (view.cursor - view.view) / view.scale != 0) return 29;
+    view.view = 7; view.cursor = 19;
+    view.cursor += 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 15 || (view.cursor - view.view) / view.scale % 4 != 2) return 29;
+    view.cursor = 17;
+    view.cursor -= 8; keep_cursor_visible(&view, 4, 2);
+    if (view.view != 7 || (view.cursor - view.view) / view.scale % 4 != 1) return 29;
     if (zoom_scale(4, 0, 1) != 6 || zoom_scale(4, 1, 1) != 3 ||
         zoom_scale(4, 0, 4) != 12 || zoom_scale(4, 1, 4) != 1) return 14;
     if (representative_start(100, 2048) != 612) return 21;
