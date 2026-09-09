@@ -10,8 +10,13 @@ Build the framebuffer viewer with `make fatpix-c`, then run it from a Linux VT
 with `./fatpix-c FILE`. It writes directly to `/dev/fb0` (override with
 `--fb PATH`) and uses no window-system or terminal UI library. Arrow keys or
 WASD move, Page Up/Down move half a viewport, `-`/`=` zoom, `g` prompts for an
-offset, `:g OFFSET` and `:s SCALE` provide direct navigation, and `q` or Escape
-exits. Scale values accept binary suffixes such as `10K` and `1.5M`.
+offset, `:g OFFSET` and `:s SCALE` provide direct navigation, and `q` exits.
+Press `i` for a centered hex/ASCII inspector around the cursor; `i` or Escape
+closes it. A mouse available through `/dev/input/mice` gets a framebuffer
+crosshair: click selects one fat-pixel byte range and drag extends a contiguous
+selection. Use `--mouse PATH` for another compatible PS/2 packet device or
+`--no-mouse` for keyboard-only operation. Scale values accept binary suffixes
+such as `10K` and `1.5M`.
 
 For framebuffer-independent inspection and parity testing, both implementations
 can emit literal classifications:
@@ -25,6 +30,8 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Added the native FatPix hex inspector and direct mouse selection, including
+  drag ranges, selection outlines, and an on-screen pointer.
 - Added a native Linux framebuffer FatPix viewer with regular-file and block-
   device sources, bounded representative sampling, literal colors, navigation,
   direct scale and goto commands, VT restoration, and the built-in 5x7 font.
