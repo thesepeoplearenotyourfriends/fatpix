@@ -271,6 +271,28 @@ app.run_command("scale 1.5M")
 assert app.file_bytes_per_cell == 1572864
 app.run_command("g 0xBEEF")
 assert app.file_cursor_addr == 0xBEEF
+
+# A buffered repeat run updates all requested ladder positions before the first
+# expensive viewport read.  Event order stops coalescing at the first other key.
+app = fatpix.FatPix(file_source=source, file_label="zoom.bin")
+app.set_file_scale(64)
+refreshes = 0
+original_refresh = app.refresh_file_grid
+def counted_refresh():
+    global refreshes
+    refreshes += 1
+    return original_refresh()
+app.refresh_file_grid = counted_refresh
+term = fatpix.RawTerminal(-1)
+term._events.extend(["="] * 6 + ["x", "="])
+first = term.read_key()
+assert fatpix.handle_key_batch(app, term, first)
+assert refreshes == 0, refreshes
+assert app.file_bytes_per_cell == fatpix.FILE_SCALE_LADDER[fatpix.FILE_SCALE_LADDER.index(64) - 6]
+assert list(term._events) == ["x", "="], list(term._events)
+if app.file_dirty:
+    app.refresh_file_grid()
+assert refreshes == 1, refreshes
 print("FatPix file status: compact position, selection, view, and Clarity state")
 PY
 

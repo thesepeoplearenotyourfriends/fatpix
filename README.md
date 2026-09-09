@@ -8,6 +8,8 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Coalesced buffered FatPix zoom repeats so only the final requested viewport is
+  read and rendered.
 - Restored separate small and large FatPix zoom steps and added abbreviated
   `goto`/`scale` commands with fractional binary-unit scale targets.
 - Displayed FatPix selections as inclusive human-readable byte ranges while

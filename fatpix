@@ -635,6 +635,22 @@ class RawTerminal:
                 self._parse_input()
         return self._events.popleft() if self._events else None
 
+    def read_queued_key_if(self, accepted):
+        """Pop the next pending event only when it is in ``accepted``.
+
+        If the parsed queue is empty, poll the terminal once so bytes already
+        waiting in the kernel join the same coalesced input run.  A different
+        event is put back at the front to preserve ordering.
+        """
+        if self._events:
+            return self._events.popleft() if self._events[0] in accepted else None
+        event = self.read_key()
+        if event in accepted:
+            return event
+        if event is not None:
+            self._events.appendleft(event)
+        return None
+
 
 class FatPix:
     def __init__(
@@ -1682,7 +1698,6 @@ class FatPix:
         self.file_bytes_per_cell = new
         self.invalidate_inspector_baseline()
         self.center_file_on_cursor()
-        self.refresh_file_grid()
         self.message = f"scale {human_size(self.file_bytes_per_cell)}/cell"
 
     def goto_file_offset(self, offset: int) -> None:
@@ -2659,6 +2674,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
+_FILE_ZOOM_KEYS = frozenset({"-", "=", "_", "+", "\r", "\n"})
+
+
+def handle_key_batch(app: FatPix, term: RawTerminal, key) -> bool:
+    """Apply one event, coalescing only an adjacent buffered file-zoom run.
+
+    ``zoom_file`` updates scale and marks the grid dirty without reading it.
+    Draining the rest of an already-buffered key-repeat run here means the main
+    loop materializes only the final viewport while preserving event order at
+    the first non-zoom input.
+    """
+    coalesce_zoom = app.file_mode and not app.command_open and key in _FILE_ZOOM_KEYS
+    if not app.handle_key(key):
+        return False
+    while coalesce_zoom:
+        pending = term.read_queued_key_if(_FILE_ZOOM_KEYS)
+        if pending is None:
+            break
+        if not app.handle_key(pending):
+            return False
+    return True
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     clarity_path = resolve_clarity_path(args.clarity)
@@ -2721,7 +2759,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
                 key = term.read_key()
                 if key is not None:
-                    if not app.handle_key(key):
+                    if not handle_key_batch(app, term, key):
                         break
                     dirty = True
 
