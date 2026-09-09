@@ -47,12 +47,14 @@ typedef struct {
     uint8_t *map, *back;
     size_t map_len;
     int mouse, mouse_x, mouse_y, font_scale;
+    int measure_text, measured_text_width;
     double mouse_speed, mouse_remainder_x, mouse_remainder_y;
 } Display;
 typedef struct {
     uint64_t view, scale, cursor, selection_start, selection_end, selection_anchor;
     uint64_t inspect_focus;
-    int cell, inspect, inspect_page, lens, selecting, help;
+    int cell, inspect, inspect_page, lens, selecting, selection_dragged, help;
+    int inspector_x, inspector_y, inspector_w, inspector_h, inspector_positioned;
     char message[160];
 } View;
 typedef struct {
@@ -588,6 +590,9 @@ static uint32_t pack_pixel(const Display *d, uint32_t rgb) {
 static void rect(Display *d, int x, int y, int w, int h, uint32_t rgb) {
     int yy, xx, bytes = d->var.bits_per_pixel / 8;
     uint32_t px = pack_pixel(d, rgb);
+    if (d->measure_text) {
+        return;
+    }
     if (x < 0) {
         w += x;
         x = 0;
@@ -610,6 +615,13 @@ static void rect(Display *d, int x, int y, int w, int h, uint32_t rgb) {
 }
 static void text5(Display *d, int x, int y, const char *s, uint32_t rgb) {
     int size = d->font_scale > 0 ? d->font_scale : 1;
+    int width = *s ? (int)strlen(s) * 6 * size - size : 0;
+    if (d->measure_text) {
+        if (width > d->measured_text_width) {
+            d->measured_text_width = width;
+        }
+        return;
+    }
     for (; *s; s++, x += 6 * size) {
         unsigned c = (unsigned char)*s;
         int yy, xx;
@@ -731,13 +743,34 @@ static void outline(Display *d, int x, int y, int cell, uint32_t color) {
     rect(d, x + cell - 1, y, 1, cell, color);
 }
 
-static void inspector_position(const Display *d, const View *v, const RenderCache *cache, int panel_w,
+static void inspector_position(const Display *d, View *v, const RenderCache *cache, int panel_w,
                                int panel_h, int *x, int *y) {
     size_t index = v->cursor >= v->view ? (size_t)((v->cursor - v->view) / v->scale) : 0;
-    int cursor_right = v->cursor >= v->view && (index % (size_t)cache->cols) >= (size_t)cache->cols / 2;
-    int cursor_bottom = v->cursor >= v->view && (index / (size_t)cache->cols) >= (size_t)cache->rows / 2;
-    *x = cursor_right ? 8 : (int)d->var.xres - panel_w - 8;
-    *y = cursor_bottom ? 8 : (int)d->var.yres - panel_h - 8;
+    int cursor_x = (int)(index % (size_t)cache->cols) * v->cell;
+    int cursor_y = (int)(index / (size_t)cache->cols) * v->cell;
+    int margin = v->cell + 8;
+    int overlap;
+    int anchored_left = v->inspector_x == 8;
+    int anchored_top = v->inspector_y == 8;
+
+    overlap = v->inspector_positioned && cursor_x + v->cell + margin >= v->inspector_x &&
+              cursor_x - margin < v->inspector_x + v->inspector_w &&
+              cursor_y + v->cell + margin >= v->inspector_y &&
+              cursor_y - margin < v->inspector_y + v->inspector_h;
+    if (!v->inspector_positioned || overlap) {
+        int cursor_right = cursor_x + v->cell / 2 >= (int)d->var.xres / 2;
+        int cursor_bottom = cursor_y + v->cell / 2 >= (int)d->var.yres / 2;
+        v->inspector_x = cursor_right ? 8 : (int)d->var.xres - panel_w - 8;
+        v->inspector_y = cursor_bottom ? 8 : (int)d->var.yres - panel_h - 8;
+        v->inspector_positioned = 1;
+    } else {
+        v->inspector_x = anchored_left ? 8 : (int)d->var.xres - panel_w - 8;
+        v->inspector_y = anchored_top ? 8 : (int)d->var.yres - panel_h - 8;
+    }
+    v->inspector_w = panel_w;
+    v->inspector_h = panel_h;
+    *x = v->inspector_x;
+    *y = v->inspector_y;
 }
 
 static uint64_t inspection_start(const Source *s, const View *v) {
@@ -753,23 +786,38 @@ static uint64_t le64(const uint8_t *p) { return (uint64_t)le32(p) | (uint64_t)le
 static uint16_t be16(const uint8_t *p) { return (uint16_t)p[0] << 8 | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)be16(p) << 16 | be16(p + 2); }
 static uint64_t be64(const uint8_t *p) { return (uint64_t)be32(p) << 32 | be32(p + 4); }
-static int render_inspector(Display *d, const Source *s, const View *v, RenderCache *cache) {
+static int render_inspector(Display *d, const Source *s, View *v, RenderCache *cache) {
     char line[512];
-    int size = d->font_scale > 0 ? d->font_scale : 1, panel_w = 500 * size, panel_h = 150 * size, x, y, row;
+    int measuring = d->measure_text;
+    int size = d->font_scale > 0 ? d->font_scale : 1, panel_w, panel_h = 150 * size, x = 0, y = 0, row;
     uint64_t cell_index = v->cursor >= v->view ? (v->cursor - v->view) / v->scale : 0,
              cell_start = v->view + cell_index * v->scale;
     uint64_t start = inspection_start(s, v),
              span = s->size - cell_start < v->scale ? s->size - cell_start : v->scale;
     size_t want = span < 256 ? 256 : (span < 1024 ? (size_t)span : 1024), n;
-    if (panel_w > (int)d->var.xres - 16) {
-        panel_w = (int)d->var.xres - 16;
+    if (!measuring) {
+        d->measure_text = 1;
+        d->measured_text_width = 0;
+        if (render_inspector(d, s, v, cache) < 0) {
+            d->measure_text = 0;
+            return -1;
+        }
+        d->measure_text = 0;
+        panel_w = d->measured_text_width + 16 * size;
+        if (panel_w > (int)d->var.xres - 16) {
+            panel_w = (int)d->var.xres - 16;
+        }
+    } else {
+        panel_w = 0;
     }
     if (panel_h > (int)d->var.yres - 16) {
         panel_h = (int)d->var.yres - 16;
     }
-    inspector_position(d, v, cache, panel_w, panel_h, &x, &y);
-    rect(d, x - 2, y - 2, panel_w + 4, panel_h + 4, 0xe0e0e0);
-    rect(d, x, y, panel_w, panel_h, 0x101010);
+    if (!measuring) {
+        inspector_position(d, v, cache, panel_w, panel_h, &x, &y);
+        rect(d, x - 2, y - 2, panel_w + 4, panel_h + 4, 0xe0e0e0);
+        rect(d, x, y, panel_w, panel_h, 0x101010);
+    }
     snprintf(line, sizeof(line), "INSPECT %s %d/7  (,/. PAGE i/ESC CLOSE)", page_names[v->inspect_page],
              v->inspect_page + 1);
     text5(d, x + 8 * size, y + 7 * size, line, 0xf1f1e8);
@@ -1073,14 +1121,30 @@ static void render_help(Display *d, const View *v) {
         text5(d, 8 * size, (int)(8 + i * 12) * size, lines[i], i ? 0xd0d0d0 : 0xf2d34f);
     }
 }
-static int render(Display *d, const Source *s, const View *v, RenderCache *cache, int grid_dirty) {
+static void footer_status(const Source *s, const View *v, char *status, size_t cap) {
+    char sc[40], selected[40];
+
+    human_scale(v->scale, sc, sizeof(sc));
+    if (v->selection_dragged && v->selection_end > v->selection_start + 1) {
+        human_scale(v->selection_end - v->selection_start, selected, sizeof(selected));
+        snprintf(status, cap, "file=%s  scale=%s/cell  pos=0x%llx  sel=0x%llx..0x%llx (%s)  view=%s",
+                 base_name(s->path), sc, (unsigned long long)v->cursor,
+                 (unsigned long long)v->selection_start, (unsigned long long)(v->selection_end - 1),
+                 selected, lens_names[v->lens]);
+    } else {
+        snprintf(status, cap, "file=%s  scale=%s/cell  pos=0x%llx  view=%s", base_name(s->path), sc,
+                 (unsigned long long)v->cursor, lens_names[v->lens]);
+    }
+}
+
+static int render(Display *d, const Source *s, View *v, RenderCache *cache, int grid_dirty) {
     uint64_t view = v->view, scale = v->scale, cursor = v->cursor;
     int cell = v->cell;
     int footer = 22 * (d->font_scale > 0 ? d->font_scale : 1);
     int cols = d->var.xres / cell, rows = ((int)d->var.yres - footer) / cell, x, y;
     size_t count;
     Cell *grid;
-    char status[512], sc[40];
+    char status[512];
     if (cols < 1 || rows < 1) {
         return -1;
     }
@@ -1163,15 +1227,7 @@ static int render(Display *d, const Source *s, const View *v, RenderCache *cache
         y = (int)(i / cols) * cell;
         outline(d, x, y, cell, 0xffffff);
     }
-    human_scale(scale, sc, sizeof(sc));
-    if (v->selection_end > v->selection_start) {
-        snprintf(status, sizeof(status), "file=%s  scale=%s  pos=0x%llx..0x%llx  view=%s", base_name(s->path),
-                 sc, (unsigned long long)v->selection_start, (unsigned long long)(v->selection_end - 1),
-                 lens_names[v->lens]);
-    } else {
-        snprintf(status, sizeof(status), "file=%s  scale=%s  pos=0x%llx  view=%s", base_name(s->path), sc,
-                 (unsigned long long)cursor, lens_names[v->lens]);
-    }
+    footer_status(s, v, status, sizeof(status));
     rect(d, 0, rows * cell, d->var.xres, d->var.yres - rows * cell, 0x050505);
     text5(d, 2, rows * cell + 2 * (d->font_scale > 0 ? d->font_scale : 1), status, 0xe0e0e0);
     text5(d, 2, rows * cell + 11 * (d->font_scale > 0 ? d->font_scale : 1),
@@ -1240,9 +1296,33 @@ static void center_view(View *v, uint64_t source_size, uint64_t cells) {
 static uint64_t representative_start(uint64_t start, uint64_t span) {
     return span > 1024 ? start + (span - 1024) / 2 : start;
 }
-static uint64_t half_page_bytes(uint64_t cells, uint64_t scale) {
-    uint64_t half = cells / 2;
-    return half > UINT64_MAX / scale ? UINT64_MAX : half * scale;
+static void page_cursor(View *v, uint64_t source_size, int cols, int rows, int down) {
+    uint64_t half_rows = (uint64_t)(rows / 2 > 0 ? rows / 2 : 1);
+    uint64_t row_bytes = (uint64_t)cols * v->scale;
+    uint64_t delta = half_rows > UINT64_MAX / row_bytes ? UINT64_MAX : half_rows * row_bytes;
+    uint64_t old_column = ((v->cursor - v->view) / v->scale) % (uint64_t)cols;
+    uint64_t page = (uint64_t)rows * row_bytes;
+    uint64_t target_row = half_rows;
+    uint64_t start, max_start;
+
+    if (down) {
+        v->cursor = v->cursor > UINT64_MAX - delta ? UINT64_MAX : v->cursor + delta;
+    } else {
+        v->cursor -= delta > v->cursor ? v->cursor : delta;
+    }
+    if (source_size && v->cursor >= source_size) {
+        v->cursor = source_size - 1;
+    }
+    if (v->cursor >= v->view && v->cursor - v->view < page) {
+        return;
+    }
+    start = v->cursor / v->scale > target_row * (uint64_t)cols + old_column
+                ? v->cursor - (target_row * (uint64_t)cols + old_column) * v->scale
+                : 0;
+    start = (start / row_bytes) * row_bytes;
+    max_start = source_size > page ? source_size - page : 0;
+    max_start = (max_start / row_bytes) * row_bytes;
+    v->view = start > max_start ? max_start : start;
 }
 static void capture_baseline(const View *v, RenderCache *c) {
     if (v->inspect && c->inspect_valid) {
@@ -1285,16 +1365,9 @@ static int mouse_event(Display *d, View *v, const Source *s, RenderCache *cache,
         d->mouse_y = (int)d->var.yres - 1;
     }
     if (v->inspect) {
-        int panel_w = 500 * size, panel_h = 150 * size, px, py;
-        if (panel_w > (int)d->var.xres - 16) {
-            panel_w = (int)d->var.xres - 16;
-        }
-        if (panel_h > (int)d->var.yres - 16) {
-            panel_h = (int)d->var.yres - 16;
-        }
-        inspector_position(d, v, cache, panel_w, panel_h, &px, &py);
-        if (d->mouse_x >= px - 2 && d->mouse_x < px + panel_w + 2 && d->mouse_y >= py - 2 &&
-            d->mouse_y < py + panel_h + 2) {
+        if (v->inspector_positioned && d->mouse_x >= v->inspector_x - 2 &&
+            d->mouse_x < v->inspector_x + v->inspector_w + 2 && d->mouse_y >= v->inspector_y - 2 &&
+            d->mouse_y < v->inspector_y + v->inspector_h + 2) {
             old_left = left;
             return 0;
         }
@@ -1324,6 +1397,7 @@ static int mouse_event(Display *d, View *v, const Source *s, RenderCache *cache,
         v->selection_anchor = a;
         v->selection_start = a;
         v->selection_end = b;
+        v->selection_dragged = 0;
         v->cursor = a;
         if (v->inspect) {
             v->inspect_focus = representative_start(a, b - a);
@@ -1336,6 +1410,7 @@ static int mouse_event(Display *d, View *v, const Source *s, RenderCache *cache,
         }
         v->selection_start = a < v->selection_anchor ? a : v->selection_anchor;
         v->selection_end = b > anchor_end ? b : anchor_end;
+        v->selection_dragged = a != v->selection_anchor;
         v->cursor = a;
     }
     old_left = left;
@@ -1644,6 +1719,7 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                 uint64_t cell_start = v.view + ((v.cursor - v.view) / v.scale) * v.scale,
                          span = s->size - cell_start < v.scale ? s->size - cell_start : v.scale;
                 v.inspect = !v.inspect;
+                v.inspector_positioned = 0;
                 v.inspect_focus = v.inspect ? representative_start(cell_start, span) : UINT64_MAX;
                 cache.inspect_valid = 0;
                 cache.baseline_n = 0;
@@ -1700,13 +1776,11 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                 } else if (z == 'D') {
                     cursor -= scale > cursor ? cursor : scale;
                 } else if ((z == '5' || z == '6') && i + 1 < n && in[i + 1] == '~') {
-                    uint64_t half = half_page_bytes((uint64_t)cols * rows, scale);
                     i++;
-                    if (z == '5') {
-                        cursor -= half > cursor ? cursor : half;
-                    } else {
-                        cursor += half;
-                    }
+                    v.cursor = cursor;
+                    page_cursor(&v, s->size, cols, rows, z == '6');
+                    cursor = v.cursor;
+                    grid_dirty = 1;
                 }
             } else if (k == 27) {
                 if (v.inspect) {
@@ -1717,6 +1791,7 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
                 }
                 if (v.selection_end > v.selection_start) {
                     v.selection_start = v.selection_end = 0;
+                    v.selection_dragged = 0;
                     snprintf(v.message, sizeof(v.message), "selection cleared");
                     present_dirty = 1;
                     continue;
