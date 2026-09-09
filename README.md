@@ -32,6 +32,7 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Made Linux VT release/acquire signals reliably wake the native event loop.
 - Fixed native inspector measurement for separately positioned text and added
   cooperative Linux VT release/acquire handling with keyboard-mode restoration.
 - Changed Python and native file-mode navigation to preserve cursor columns and

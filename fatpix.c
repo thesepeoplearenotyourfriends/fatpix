@@ -84,28 +84,86 @@ static const char *lens_names[] = {"",         "literal",       "xor-prev",  "de
 static const char *page_names[] = {"HEX", "TEXT", "NUM", "MAGIC", "STATS", "RANGE", "DIFF HEX"};
 
 static volatile sig_atomic_t stopping, vt_release_requested, vt_acquire_requested;
+static int signal_wake_pipe[2] = {-1, -1};
+
+static void wake_event_loop(void) {
+    int saved_errno = errno;
+    uint8_t byte = 1;
+
+    if (signal_wake_pipe[1] >= 0) {
+        ssize_t written = write(signal_wake_pipe[1], &byte, sizeof(byte));
+        (void)written;
+    }
+    errno = saved_errno;
+}
+
 static void stop_now(int sig) {
     (void)sig;
     stopping = 1;
+    wake_event_loop();
 }
 
 static void request_vt_release(int sig) {
     (void)sig;
     vt_release_requested = 1;
+    wake_event_loop();
 }
 
 static void request_vt_acquire(int sig) {
     (void)sig;
     vt_acquire_requested = 1;
+    wake_event_loop();
+}
+
+static int open_signal_wake_pipe(void) {
+    int i;
+
+    if (pipe(signal_wake_pipe) < 0) {
+        return -1;
+    }
+    for (i = 0; i < 2; i++) {
+        int flags = fcntl(signal_wake_pipe[i], F_GETFL);
+        int fd_flags = fcntl(signal_wake_pipe[i], F_GETFD);
+        if (flags < 0 || fd_flags < 0 || fcntl(signal_wake_pipe[i], F_SETFL, flags | O_NONBLOCK) < 0 ||
+            fcntl(signal_wake_pipe[i], F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            close(signal_wake_pipe[0]);
+            close(signal_wake_pipe[1]);
+            signal_wake_pipe[0] = signal_wake_pipe[1] = -1;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void close_signal_wake_pipe(void) {
+    if (signal_wake_pipe[0] >= 0) {
+        close(signal_wake_pipe[0]);
+    }
+    if (signal_wake_pipe[1] >= 0) {
+        close(signal_wake_pipe[1]);
+    }
+    signal_wake_pipe[0] = signal_wake_pipe[1] = -1;
+}
+
+static void drain_signal_wake_pipe(void) {
+    uint8_t bytes[64];
+
+    while (read(signal_wake_pipe[0], bytes, sizeof(bytes)) > 0) {
+        ;
+    }
 }
 
 static int install_signal_handlers(void) {
     struct sigaction action;
+
+    if (open_signal_wake_pipe() < 0) {
+        return -1;
+    }
     memset(&action, 0, sizeof(action));
     action.sa_handler = stop_now;
     sigemptyset(&action.sa_mask);
-    /* Deliberately omit SA_RESTART: an idle blocking read must wake so the VT
-     * and termios state are restored without waiting for another keypress. */
+    /* Deliberately omit SA_RESTART as a fallback; the self-pipe is the reliable
+     * wakeup path around the flag-check/poll boundary. */
     if (sigaction(SIGINT, &action, NULL) < 0 || sigaction(SIGTERM, &action, NULL) < 0 ||
         sigaction(SIGHUP, &action, NULL) < 0) {
         return -1;
@@ -1661,10 +1719,12 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     stopping = 0;
     vt_release_requested = vt_acquire_requested = 0;
     if (install_signal_handlers() < 0) {
+        close_signal_wake_pipe();
         return -1;
     }
     if (display_open(&d, fb, mouse) < 0) {
         display_close(&d);
+        close_signal_wake_pipe();
         return -1;
     }
     d.mouse_speed = mouse_speed;
@@ -1673,7 +1733,8 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     d.mouse_y = (int)d.var.yres / 2;
     while (!stopping) {
         int cols = d.var.xres / cell, rows = ((int)d.var.yres - 22 * font_scale) / cell;
-        struct pollfd fds[2] = {{d.tty, POLLIN, 0}, {d.mouse, POLLIN, 0}};
+        struct pollfd fds[3] = {
+            {d.tty, POLLIN, 0}, {d.mouse, POLLIN, 0}, {signal_wake_pipe[0], POLLIN, 0}};
         uint64_t old_view = v.view;
         if (handle_vt_requests(&d, &present_dirty) < 0) {
             break;
@@ -1694,11 +1755,21 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
             }
             present_dirty = grid_dirty = 0;
         }
-        if (poll(fds, d.mouse >= 0 ? 2 : 1, -1) < 0) {
+        if (poll(fds, 3, -1) < 0) {
             if (errno == EINTR) {
                 continue;
             }
             break;
+        }
+        if (fds[2].revents & POLLIN) {
+            drain_signal_wake_pipe();
+            if (handle_vt_requests(&d, &present_dirty) < 0) {
+                break;
+            }
+            if (stopping || !d.active) {
+                mouse_n = 0;
+                continue;
+            }
         }
         if (d.mouse >= 0 && (fds[1].revents & POLLIN)) {
             uint8_t buf[48];
@@ -1923,6 +1994,7 @@ static int interactive(Source *s, const char *fb, const char *mouse, int cell, u
     free(cache.sample_n);
     free(cache.context_n);
     display_close(&d);
+    close_signal_wake_pipe();
     return stopping ? 0 : -1;
 }
 

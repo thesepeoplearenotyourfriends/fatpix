@@ -535,6 +535,20 @@ int main(void) {
         a.cursor = 700; a.scale = 10; a.view = 0; center_view(&a, 4096, 80);
         if (a.view != 300) return 17;
     }
+    {
+        struct pollfd wake = {0};
+        vt_release_requested = 0;
+        if (open_signal_wake_pipe() < 0) return 31;
+        wake.fd = signal_wake_pipe[0];
+        wake.events = POLLIN;
+        request_vt_release(SIGUSR1);
+        if (!vt_release_requested || poll(&wake, 1, 0) != 1 || !(wake.revents & POLLIN)) return 31;
+        drain_signal_wake_pipe();
+        wake.revents = 0;
+        if (poll(&wake, 1, 0) != 0) return 31;
+        close_signal_wake_pipe();
+        vt_release_requested = 0;
+    }
     free(cache.cells); free(cache.literal_cells); free(cache.samples); free(cache.contexts); free(cache.previous); free(cache.sample_n); free(cache.context_n);
     free(display.map); free(display.back);
     return result < 0 ? 4 : 0;
