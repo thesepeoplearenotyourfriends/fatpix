@@ -641,7 +641,7 @@ class FatPix:
         self.selected = 6
         self.file_source = file_source
         self.private = private
-        self.file_label = "PR:[redacted]" if private and file_label else (f"PR:[{file_label}]" if file_label else "stdin")
+        self.file_label = "[redacted]" if private and file_label else (os.path.basename(file_label) if file_label else "stdin")
         self.clarity_path = clarity_path
         # enabled = user has the semantic lens switched on; active = this
         # viewport currently contains at least one recognized structural view.
@@ -1545,10 +1545,7 @@ class FatPix:
             self.recolor_file_grid()
 
         length = self.file_selection_end - self.file_selection_start
-        self.message = (
-            f"selected 0x{self.file_selection_start:x}..0x{self.file_selection_end:x} "
-            f"({human_size(length)})"
-        )
+        self.message = f"selected {human_size(length)}"
 
     def clear_file_selection(self) -> None:
         self.file_selection_anchor = None
@@ -2275,40 +2272,16 @@ class FatPix:
                     + "\x1b[K"
                 )
 
-            info = self.current_file_info()
-            assert self.file_source is not None
-            scale = str(self.file_bytes_per_cell)
-            if info:
-                start = info["start"]
-                end = start + max(0, info["span"])
-                # cursor already names the exact 1-byte address; only spell out
-                # the cell extent when a coarse pixel actually spans a range.
-                locus = "" if info["span"] == 1 else f"cell=0x{start:x}..0x{end:x}"
-                detail = f"{locus} {info.get('lens_detail', '')}".strip()
-            else:
-                detail = "no cell"
-            selection = ""
+            scale = human_size(self.file_bytes_per_cell).replace(" ", "")
+            position = f"0x{self.file_cursor_addr:x}"
             if self.file_selection_start is not None and self.file_selection_end is not None:
-                selection = (
-                    f" sel=0x{self.file_selection_start:x}..0x{self.file_selection_end:x}"
-                    f"({human_size(self.file_selection_end - self.file_selection_start)})"
-                )
-            clarity = ""
-            if self.clarity_enabled:
-                ann = self.clarity_annotation_at(self.file_cursor_addr)
-                if ann is not None:
-                    path = str(ann.get('path', ann.get('label', 'view')))
-                    clarity = f" clarity=\x1b[1m{path}\x1b[22m"
-                elif self.clarity_active:
-                    clarity = " clarity=on"
-                else:
-                    clarity = " clarity=none"
+                position = f"0x{self.file_selection_start:x}..0x{self.file_selection_end:x}"
+            clarity = "on" if self.clarity_enabled else "off"
             line1 = (
-                f"file={self.file_label} cursor=0x{self.file_cursor_addr:x} scale:{scale} "
-                f"size={human_size(self.file_source.size)}"
-                f"{clarity} {detail}{selection}"
+                f"file={self.file_label}  scale={scale}  pos={position}  "
+                f"view={FILE_LENSES[self.file_lens]}  clarity={clarity}"
             )
-            line2 = "? for help" + (f" | {self.message}" if self.message else "")
+            line2 = "? help" + (f" | {self.message}" if self.message else "")
             return (
                 "\x1b[0m"
                 + fit_line(line1, self.term_cols)

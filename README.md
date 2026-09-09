@@ -8,8 +8,11 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
-- Exposed truncated ELF structures embedded within larger byte streams as
-  partial views without promoting them to object identity.
+- Identified corroborated ELF objects embedded within larger byte streams while
+  reporting truncated projections separately from identity confidence.
+- Simplified FatPix's permanent file footer and moved cell diagnostics into its
+  inspector pages.
+- Removed a stale acceptance reference to a deleted corrupt JPEG fixture.
 - Grounded SQLite opaque-page ownership in an explicit KSY page-size/page-count
   extent relationship instead of inferring geometry from matching scalars.
 - Completed whole-file projection for the real PNG, ZIP, SQLite, and WAV
