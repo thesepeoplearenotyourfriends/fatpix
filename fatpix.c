@@ -39,6 +39,19 @@ typedef struct {
 static volatile sig_atomic_t stopping;
 static void stop_now(int sig) { (void)sig; stopping = 1; }
 
+static int install_signal_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = stop_now;
+    sigemptyset(&action.sa_mask);
+    /* Deliberately omit SA_RESTART: an idle blocking read must wake so the VT
+     * and termios state are restored without waiting for another keypress. */
+    if (sigaction(SIGINT, &action, NULL) < 0 ||
+        sigaction(SIGTERM, &action, NULL) < 0 ||
+        sigaction(SIGHUP, &action, NULL) < 0) return -1;
+    return 0;
+}
+
 static const uint32_t palette[9] = {
     0x050505, 0xf1f1e8, 0xef3e36, 0x2677c9, 0xe67e2f,
     0xf2d34f, 0x74b83f, 0x9b45b2, 0x444444
@@ -324,14 +337,16 @@ static int read_key(int fd,char *out,size_t cap) {
 }
 static int interactive(Source *s,const char *fb,int cell,uint64_t scale,uint64_t cursor) {
     Display d; char in[256],command[128]; size_t cmdn=0; int command_mode=0,dirty=1,n,i; uint64_t view=0;
+    stopping=0;
+    if(install_signal_handlers()<0)return -1;
     if(display_open(&d,fb)<0){display_close(&d);return -1;}
-    signal(SIGINT,stop_now);signal(SIGTERM,stop_now);signal(SIGHUP,stop_now);
     while(!stopping){int cols=d.var.xres/cell,rows=((int)d.var.yres-22)/cell;uint64_t page=(uint64_t)cols*rows*scale;
         if(cursor>=s->size&&s->size)cursor=s->size-1;
         if(cursor<view)view=(cursor/scale)*scale;else if(cursor>=view+page)view=((cursor/scale)-(uint64_t)cols*rows+1)*scale;
         if(dirty){if(render(&d,s,view,scale,cursor,cell)<0)break;dirty=0;}
         n=read_key(d.tty,in,sizeof(in));if(n<0)break;
         for(i=0;i<n;i++){unsigned char k=in[i];uint64_t move=0;
+            if(k==3){stopping=1;break;}
             if(command_mode){if(k==27){command_mode=0;cmdn=0;dirty=1;}else if(k=='\r'||k=='\n'){uint64_t v;command[cmdn]=0;
                     if((!strncmp(command,"g ",2)||!strncmp(command,"goto ",5))&&parse_u64(command+(command[1]==' '?2:5),0,&v)==0)cursor=v;
                     else if((!strncmp(command,"s ",2)||!strncmp(command,"scale ",6))&&parse_u64(command+(command[1]==' '?2:6),1,&v)==0&&v)scale=v;

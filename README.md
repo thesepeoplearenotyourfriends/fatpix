@@ -30,6 +30,8 @@ can emit literal classifications:
   direct scale and goto commands, VT restoration, and the built-in 5x7 font.
 - Added matching deterministic logical-grid output to the Python and C viewers
   for literal-lens parity checks without a framebuffer.
+- Ensured native builds are available to `make check` and made idle signals and
+  raw Ctrl-C promptly leave the input loop so VT state is restored.
 
 ### 2026-09-08
 

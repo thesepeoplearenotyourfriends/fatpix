@@ -9,7 +9,7 @@ garble: FORCE garble.c
 fatpix-c: FORCE fatpix.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ fatpix.c -lm
 
-check: garble
+check: garble fatpix-c
 	./test.sh
 
 clean:
