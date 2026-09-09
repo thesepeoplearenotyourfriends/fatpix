@@ -32,6 +32,9 @@ can emit literal classifications:
 
 ### 2026-09-09
 
+- Matched native cursor navigation to FatPix's stable in-viewport row wrapping
+  and centered, scale-aligned viewport changes, and added lowercase native font
+  glyphs.
 - Moved the native inspector between screen corners to avoid the selected cell,
   added configurable mouse-motion speed, and made all native text globally
   scalable.
