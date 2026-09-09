@@ -1302,6 +1302,7 @@ static uint64_t representative_start(uint64_t start, uint64_t span) {
 static void page_cursor(View *v, uint64_t source_size, int cols, int rows, int down) {
     uint64_t half_rows = (uint64_t)(rows / 2 > 0 ? rows / 2 : 1);
     uint64_t row_bytes = (uint64_t)cols * v->scale;
+    uint64_t view_phase = v->view % row_bytes;
     uint64_t delta = half_rows > UINT64_MAX / row_bytes ? UINT64_MAX : half_rows * row_bytes;
     uint64_t old_column = ((v->cursor - v->view) / v->scale) % (uint64_t)cols;
     uint64_t page = (uint64_t)rows * row_bytes;
@@ -1322,9 +1323,8 @@ static void page_cursor(View *v, uint64_t source_size, int cols, int rows, int d
     start = v->cursor / v->scale > target_row * (uint64_t)cols + old_column
                 ? v->cursor - (target_row * (uint64_t)cols + old_column) * v->scale
                 : 0;
-    start = (start / row_bytes) * row_bytes;
     max_start = source_size > page ? source_size - page : 0;
-    max_start = (max_start / row_bytes) * row_bytes;
+    max_start = max_start >= view_phase ? max_start - (max_start - view_phase) % row_bytes : 0;
     v->view = start > max_start ? max_start : start;
 }
 static void capture_baseline(const View *v, RenderCache *c) {

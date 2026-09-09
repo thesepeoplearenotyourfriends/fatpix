@@ -455,6 +455,9 @@ int main(void) {
     if (view.cursor != 87 || ((view.cursor - view.view) / view.scale) % 10 != 7) return 25;
     page_cursor(&view, 10000, 10, 8, 0);
     if (view.cursor != 47 || ((view.cursor - view.view) / view.scale) % 10 != 7) return 25;
+    view.view = 3; view.cursor = 80; view.scale = 1;
+    page_cursor(&view, 10000, 10, 8, 1);
+    if (view.cursor != 120 || view.view != 73 || (view.cursor - view.view) % 10 != 7) return 25;
     source.path = "/tmp/sample.bin"; view.lens = 1; view.cursor = 0x8100;
     view.scale = 1024; view.selection_start = 0x7383; view.selection_end = 0x8b83;
     view.selection_dragged = 0; footer_status(&source, &view, footer, sizeof(footer));
