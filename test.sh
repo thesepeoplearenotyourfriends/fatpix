@@ -235,12 +235,42 @@ app.file_selection_start = 16
 app.file_selection_end = 80
 app.message = "selected 64 B"
 status = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", app.render_status())
-assert "pos=0x10..0x50" in status, status
+assert "pos=0x10..0x4f" in status, status
 assert status.split("\n", 1)[1] == "? help | selected 64 B", status
 
 app.inspect_page = app.inspect_pages.index("STATS")
 stats = "\n".join(app.inspector_lines(100, 20))
 assert "entropy=" in stats and "zero=" in stats and "printable=" in stats, stats
+
+# Shifted zoom keys jump several positions on the same scale ladder.  They must
+# remain distinct from the ordinary one-step keys and retain inspector focus.
+source = fatpix.ByteSource(data=bytes(range(256)) * 256)
+app = fatpix.FatPix(file_source=source, file_label="zoom.bin")
+app.set_file_scale(64)
+app.inspect_open = True
+app.inspect_focus_addr = 0x1234
+app.handle_key("=")
+small_in = app.file_bytes_per_cell
+assert app.file_cursor_addr == 0x1234
+app.set_file_scale(64)
+app.handle_key("+")
+large_in = app.file_bytes_per_cell
+assert large_in < small_in < 64, (large_in, small_in)
+assert app.file_cursor_addr == 0x1234
+app.set_file_scale(64)
+app.handle_key("-")
+small_out = app.file_bytes_per_cell
+app.set_file_scale(64)
+app.handle_key("_")
+large_out = app.file_bytes_per_cell
+assert 64 < small_out < large_out, (small_out, large_out)
+
+app.run_command("s 10K")
+assert app.file_bytes_per_cell == 10 * 1024
+app.run_command("scale 1.5M")
+assert app.file_bytes_per_cell == 1572864
+app.run_command("g 0xBEEF")
+assert app.file_cursor_addr == 0xBEEF
 print("FatPix file status: compact position, selection, view, and Clarity state")
 PY
 

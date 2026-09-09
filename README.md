@@ -8,6 +8,10 @@ binary analyzer, and Garble provides reversible transformations.
 
 ### 2026-09-08
 
+- Restored separate small and large FatPix zoom steps and added abbreviated
+  `goto`/`scale` commands with fractional binary-unit scale targets.
+- Displayed FatPix selections as inclusive human-readable byte ranges while
+  retaining half-open ranges internally.
 - Identified corroborated ELF objects embedded within larger byte streams while
   reporting truncated projections separately from identity confidence.
 - Simplified FatPix's permanent file footer and moved cell diagnostics into its
