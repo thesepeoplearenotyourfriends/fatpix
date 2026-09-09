@@ -4,7 +4,34 @@ Small, local tools for seeing, interpreting, and experimentally transforming
 opaque bytes. FatPix is a terminal visualizer, Clarity is an evidence-conscious
 binary analyzer, and Garble provides reversible transformations.
 
+## Native FatPix
+
+Build the framebuffer viewer with `make fatpix-c`, then run it from a Linux VT
+with `./fatpix-c FILE`. It writes directly to `/dev/fb0` (override with
+`--fb PATH`) and uses no window-system or terminal UI library. Arrow keys or
+WASD move, Page Up/Down move half a viewport, `-`/`=` zoom, `g` prompts for an
+offset, `:g OFFSET` and `:s SCALE` provide direct navigation, and `q` or Escape
+exits. Scale values accept binary suffixes such as `10K` and `1.5M`.
+
+For framebuffer-independent inspection and parity testing, both implementations
+can emit literal classifications:
+
+```text
+./fatpix-c --dump-grid 16x8 --scale 1K FILE
+./fatpix --file FILE --dump-grid 16x8 --scale 1K
+```
+
 ## Changelog
+
+### 2026-09-09
+
+- Added a native Linux framebuffer FatPix viewer with regular-file and block-
+  device sources, bounded representative sampling, literal colors, navigation,
+  direct scale and goto commands, VT restoration, and the built-in 5x7 font.
+- Added matching deterministic logical-grid output to the Python and C viewers
+  for literal-lens parity checks without a framebuffer.
+- Ensured native builds are available to `make check` and made idle signals and
+  raw Ctrl-C promptly leave the input loop so VT state is restored.
 
 ### 2026-09-08
 

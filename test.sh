@@ -296,6 +296,16 @@ assert refreshes == 1, refreshes
 print("FatPix file status: compact position, selection, view, and Clarity state")
 PY
 
+# Native and Python FatPix share deterministic literal-lens classifications at
+# byte scale and at coarse representative-sampling scales.
+./fatpix-c --dump-grid 16x4 --scale 1 --offset 0 test/sample.png > "$tmp/fatpix-c-fine.grid"
+./fatpix --file test/sample.png --dump-grid 16x4 --scale 1 --offset 0 > "$tmp/fatpix-py-fine.grid"
+cmp "$tmp/fatpix-c-fine.grid" "$tmp/fatpix-py-fine.grid"
+./fatpix-c --dump-grid 8x4 --scale 10K --offset 7 test/sample.avi > "$tmp/fatpix-c-coarse.grid"
+./fatpix --file test/sample.avi --dump-grid 8x4 --scale 10K --offset 7 > "$tmp/fatpix-py-coarse.grid"
+cmp "$tmp/fatpix-c-coarse.grid" "$tmp/fatpix-py-coarse.grid"
+printf 'FatPix native parity: literal byte and bounded coarse grids agree\n'
+
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
 python3 clarity.py --stats "$tmp/probe-xor.grb" > "$tmp/explicit-stats.txt"
