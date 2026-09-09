@@ -363,13 +363,30 @@ int main(void) {
     if (!((uint32_t *)display.back)[4] || !((uint32_t *)display.back)[5] ||
         !((uint32_t *)(display.back + display.fix.line_length))[4] ||
         ((uint32_t *)display.back)[2]) return 9;
+    if (!memcmp(font5x7['a' - 32], font5x7['A' - 32], 7) ||
+        memcmp(font5x7['a' - 32], (const uint8_t[]){0,0,14,1,15,17,15}, 7)) return 10;
+
+    view.view = 0; view.scale = 2; view.cursor = 0;
+    for (int step = 1; step <= 7; step++) {
+        view.cursor += view.scale;
+        keep_cursor_visible(&view, 100, 8);
+        if (view.view != 0 || (view.cursor - view.view) / view.scale != (uint64_t)step) return 11;
+        if (step == 4 && ((view.cursor - view.view) / view.scale % 4 != 0 ||
+                          (view.cursor - view.view) / view.scale / 4 != 1)) return 11;
+    }
+    view.cursor += view.scale;
+    keep_cursor_visible(&view, 100, 8);
+    if (view.view != 8 || (view.cursor - view.view) / view.scale != 4) return 12;
+    view.cursor += view.scale;
+    keep_cursor_visible(&view, 100, 8);
+    if (view.view != 8 || (view.cursor - view.view) / view.scale != 5) return 13;
     free(cache.cells); free(display.map); free(display.back);
     return result < 0 ? 4 : 0;
 }
 C
 ${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-cache-test.c" -lm -o "$tmp/fatpix-cache-test"
 "$tmp/fatpix-cache-test"
-printf 'FatPix native rendering: caches, corner inspector, mouse speed, and text scale agree\n'
+printf 'FatPix native rendering: caches, cursor recentering, lowercase text, inspector, mouse speed, and text scale agree\n'
 
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
