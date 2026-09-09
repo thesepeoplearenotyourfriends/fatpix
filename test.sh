@@ -345,7 +345,7 @@ int main(void) {
     result = render(&display, &source, &view, &cache, 0);
     view.selecting = 1;
     display.mouse_y = display.var.yres - 1;
-    mouse_event(&display, &view, &source, (const uint8_t[]){8, 0, 0});
+    mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 0, 0});
     if (view.selecting) return 5;
     view.cursor = 0;
     inspector_position(&display, &view, &cache, 60, 40, &panel_x, &panel_y);
@@ -355,8 +355,8 @@ int main(void) {
     if (panel_x != 8 || panel_y != 8) return 7;
     display.mouse_speed = 0.5; display.mouse_x = 10; display.mouse_y = 10;
     display.mouse_remainder_x = display.mouse_remainder_y = 0.0;
-    mouse_event(&display, &view, &source, (const uint8_t[]){8, 1, 0});
-    mouse_event(&display, &view, &source, (const uint8_t[]){8, 1, 0});
+    mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 1, 0});
+    mouse_event(&display, &view, &source, &cache, (const uint8_t[]){8, 1, 0});
     if (display.mouse_x != 11) return 8;
     display.font_scale = 2; memset(display.back, 0, display.map_len);
     text5(&display, 0, 0, "!", 0xffffff);
@@ -385,7 +385,33 @@ int main(void) {
     if (classify_lens(2, (const uint8_t[]){0xaa,0xaa}, 2, 0xaa, NULL, 0, NULL, 0).color != 0 ||
         classify_lens(3, (const uint8_t[]){0,255}, 2, 0, NULL, 0, NULL, 0).color != 7 ||
         lens_number("neighbor") != 5 || lens_number("d") != 3) return 15;
-    free(cache.cells); free(cache.samples); free(cache.previous); free(cache.sample_n);
+    {
+        char g[] = "g 17", go[] = "goto 19", s[] = "s 3", scale[] = "scale 6";
+        char named[] = "view cursor", numbered[] = "view 2";
+        view.inspect = 1;
+        view.inspect_focus = 11; source.size = 1024;
+        if (run_file_command(&source, &view, g) != 2 || view.cursor != 17 ||
+            run_file_command(&source, &view, go) != 2 || view.cursor != 19 ||
+            run_file_command(&source, &view, s) != 2 || view.scale != 3 || view.cursor != 19 ||
+            run_file_command(&source, &view, scale) != 2 || view.scale != 6 ||
+            run_file_command(&source, &view, named) != 1 || view.lens != 6 ||
+            run_file_command(&source, &view, numbered) != 1 || view.lens != 2) return 16;
+        view.cursor = 700; view.scale = 6; center_view(&view, 1024, 8);
+        if (view.view != 672) return 17;
+    }
+    {
+        Source commands = {.size = 4096, .path = "/tmp/source"};
+        View a = {.scale = 1, .inspect_focus = UINT64_MAX}, b = a;
+        char g1[] = "g 0x321", g2[] = "goto 0x321", s1[] = "s 1.5K", s2[] = "scale 1.5K";
+        char named[] = "view neighbor";
+        if (run_file_command(&commands, &a, g1) != 2 || run_file_command(&commands, &b, g2) != 2 ||
+            a.cursor != b.cursor || run_file_command(&commands, &a, s1) != 2 ||
+            run_file_command(&commands, &b, s2) != 2 || a.scale != b.scale ||
+            run_file_command(&commands, &a, named) != 1 || a.lens != 5) return 16;
+        a.cursor = 700; a.scale = 10; a.view = 0; center_view(&a, 4096, 80);
+        if (a.view != 300) return 17;
+    }
+    free(cache.cells); free(cache.literal_cells); free(cache.samples); free(cache.contexts); free(cache.previous); free(cache.sample_n); free(cache.context_n);
     free(display.map); free(display.back);
     return result < 0 ? 4 : 0;
 }
@@ -394,9 +420,46 @@ ${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-cach
 "$tmp/fatpix-cache-test"
 printf 'FatPix native rendering: caches, cursor recentering, lowercase text, inspector, mouse speed, and text scale agree\n'
 
-# Static native behavior checks cover the Python scale ladder and every native
-# lens classifier without requiring framebuffer hardware.
-printf 'FatPix native retirement parity: zoom ladder, command aliases, and six lenses agree\n'
+printf 'FatPix native behavior: zoom ladder, centering, command aliases, and six lens classifiers checked\n'
+
+cat > "$tmp/fatpix-lens-probe.c" <<'C'
+#define main fatpix_program_main
+#include "fatpix.c"
+#undef main
+int main(int argc, char **argv) {
+    Source source; View view = {0}; RenderCache cache = {0}; size_t i;
+    if (argc != 4 || source_open(&source, argv[1]) < 0) return 1;
+    view.scale = strtoull(argv[2], NULL, 10); view.lens = atoi(argv[3]);
+    cache.count = 8; cache.cells = calloc(cache.count, sizeof(*cache.cells));
+    if (!cache.cells || make_grid(&source, 0, view.scale, cache.count, cache.cells) < 0 ||
+        load_samples(&source, &view, &cache) < 0) return 2;
+    if (view.lens != 1) recolor_grid(&view, &cache);
+    for (i = 0; i < cache.count; i++) printf("%u%c", cache.cells[i].color, i == 7 ? '\n' : ' ');
+    return 0;
+}
+C
+${CC:-cc} ${CFLAGS:--O2 -std=c99 -Wall -Wextra -Wpedantic} -I. "$tmp/fatpix-lens-probe.c" -lm -lz -o "$tmp/fatpix-lens-probe"
+for scale in 1 300; do
+    for lens in 1 2 3 4 5 6; do
+        c_out="$tmp/c-$scale-$lens"; py="$tmp/py-$scale-$lens"
+        "$tmp/fatpix-lens-probe" test/sample.png "$scale" "$lens" > "$c_out"
+        python3 - test/sample.png "$scale" "$lens" > "$py" <<'PY'
+import runpy, sys
+ns = runpy.run_path("fatpix")
+source = ns["ByteSource"](path=sys.argv[1])
+app = ns["FatPix"](file_source=source, file_label=sys.argv[1])
+app.w, app.h = 8, 1
+app.file_bytes_per_cell = int(sys.argv[2])
+app.file_view_start = app.file_cursor_addr = 0
+app.refresh_file_grid()
+app.set_file_lens(int(sys.argv[3]))
+print(" ".join(str(value) for value in app.grid[0]))
+source.close()
+PY
+        cmp "$c_out" "$py"
+    done
+done
+printf 'FatPix Python/C parity: all six lenses agree at byte and context-sampling scales\n'
 
 # Raw statistics remain available without interpretation; --stats is explicit STFU mode.
 python3 clarity.py "$tmp/probe-xor.grb" > "$tmp/default-stats.txt"
